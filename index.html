@@ -45,6 +45,7 @@
 
     <script>
         const STORAGE_KEY = 'logiflow_data_v1';
+        const GOOGLE_SHEETS_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbzjvkzK87cY4aMRY6LmRTXEpNpkAjcl82GjMTsKVMO0Bmht4TIg-9xFG23gzBNQMK_D/exec';
         const INITIAL_DATA = {
             products: [
                 { id: 'p1', name: '標準紙箱 (大)', sku: 'BOX-L-001', category: '包材', stock: 500, safetyStock: 100, price: 15 },
@@ -139,13 +140,32 @@
             }
             getOrders() { return this.data.orders.sort((a, b) => new Date(b.date) - new Date(a.date)); }
             createOrder(branch, items, dateISO = null) {
-                this.data.orders.unshift({
+                const order = {
                     id: 'o' + Date.now(),
                     branch,
                     date: this.normalizeDayISO(dateISO || new Date()),
                     status: 'pending',
                     items
-                });
+                };
+                this.data.orders.unshift(order);
+                this.save();
+                return order;
+            }
+            replaceOrders(orders) {
+                if (!Array.isArray(orders)) return;
+                this.data.orders = orders.map(o => ({
+                    id: o.id || ('o' + Date.now()),
+                    branch: o.branch || '',
+                    date: this.normalizeDayISO(o.date || new Date()),
+                    status: o.status || 'pending',
+                    items: (o.items || []).map(i => ({
+                        productId: i.productId || '',
+                        quantity: Math.max(0, parseInt(i.quantity) || 0),
+                        name: i.name,
+                        sku: i.sku,
+                        price: typeof i.price === 'number' ? i.price : 0
+                    }))
+                }));
                 this.save();
             }
             updateOrderStatus(orderId, status) {
@@ -253,6 +273,64 @@
             getLanguage() { return this.data.settings.language || 'zh'; }
         }
         const store = new Store();
+        async function sendOrderToGoogleSheets(order) {
+            try {
+                if (!GOOGLE_SHEETS_WEBAPP_URL) return;
+                const products = store.getProducts();
+                const payload = {
+                    id: order.id,
+                    branch: order.branch,
+                    date: order.date,
+                    status: order.status,
+                    items: (order.items || []).map(i => {
+                        const p = products.find(x => x.id === i.productId) || {};
+                        return {
+                            productId: i.productId,
+                            name: p.name || '',
+                            sku: p.sku || '',
+                            price: typeof p.price === 'number' ? p.price : 0,
+                            quantity: i.quantity
+                        };
+                    })
+                };
+                await fetch(GOOGLE_SHEETS_WEBAPP_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    mode: 'cors'
+                });
+            } catch (err) {
+                console.warn('Send to Google Sheets failed:', err && err.message ? err.message : err);
+            }
+        }
+        async function fetchOrdersFromGoogleSheets() {
+            try {
+                if (!GOOGLE_SHEETS_WEBAPP_URL) return null;
+                const res = await fetch(GOOGLE_SHEETS_WEBAPP_URL + '?action=list', { method: 'GET', mode: 'cors' });
+                const data = await res.json();
+                if (Array.isArray(data && data.orders)) return data.orders;
+                if (Array.isArray(data)) {
+                    const byId = {};
+                    data.forEach(r => {
+                        const id = r.id || r.order_id || '';
+                        if (!id) return;
+                        if (!byId[id]) byId[id] = { id, branch: r.branch || '', date: r.date || new Date().toISOString(), status: r.status || 'pending', items: [] };
+                        byId[id].items.push({
+                            productId: r.productId || r.product_id || '',
+                            name: r.item_name || r.name || '',
+                            sku: r.item_sku || r.sku || '',
+                            price: typeof r.item_price === 'number' ? r.item_price : (typeof r.price === 'number' ? r.price : 0),
+                            quantity: Math.max(0, parseInt(r.item_qty || r.quantity) || 0)
+                        });
+                    });
+                    return Object.values(byId);
+                }
+                return null;
+            } catch (err) {
+                console.warn('Fetch from Google Sheets failed:', err && err.message ? err.message : err);
+                return null;
+            }
+        }
     </script>
 
     <script>
@@ -968,17 +1046,17 @@
                     branchGroups[o.branch].orders.push(o);
                     o.items.forEach(item => {
                         const p = products.find(prod => prod.id === item.productId);
-                        if (!p) return;
-                        const price = p.price;
+                        const price = p ? p.price : (typeof item.price === 'number' ? item.price : 0);
                         const cost = price * item.quantity;
                         totalAmount += cost;
                         totalQty += item.quantity;
                         totalItems++;
-                        if (!branchGroups[o.branch].products[item.productId]) {
-                            branchGroups[o.branch].products[item.productId] = { name: p.name, sku: p.sku, qty: 0, amount: 0 };
+                        const key = item.productId || (item.name || '') + (item.sku || '');
+                        if (!branchGroups[o.branch].products[key]) {
+                            branchGroups[o.branch].products[key] = { name: p ? p.name : (item.name || ''), sku: p ? p.sku : (item.sku || ''), qty: 0, amount: 0 };
                         }
-                        branchGroups[o.branch].products[item.productId].qty += item.quantity;
-                        branchGroups[o.branch].products[item.productId].amount += cost;
+                        branchGroups[o.branch].products[key].qty += item.quantity;
+                        branchGroups[o.branch].products[key].amount += cost;
                     });
                 });
                 this.currentGroups = branchGroups;
@@ -988,6 +1066,35 @@
                     ${UI.createCard(t('reports.stats.qty'), totalQty, '')}
                     ${UI.createCard(t('reports.stats.orders'), filteredOrders.length, '')}
                 `;
+                fetchOrdersFromGoogleSheets().then(remote => {
+                    if (Array.isArray(remote) && remote.length) {
+                        store.replaceOrders(remote);
+                        // Recompute with remote data
+                        const orders2 = store.getOrders();
+                        const filtered2 = orders2.filter(o => {
+                            const d = new Date(o.date);
+                            const matchDate = d >= start && d <= end;
+                            const matchBranch = this.state.branch === 'all' || o.branch === this.state.branch;
+                            return matchDate && matchBranch;
+                        });
+                        let totalAmount2 = 0;
+                        let totalQty2 = 0;
+                        const products2 = store.getProducts();
+                        filtered2.forEach(o => {
+                            o.items.forEach(item => {
+                                const p = products2.find(prod => prod.id === item.productId);
+                                const price = p ? p.price : (typeof item.price === 'number' ? item.price : 0);
+                                totalAmount2 += price * item.quantity;
+                                totalQty2 += item.quantity;
+                            });
+                        });
+                        document.getElementById('report-stats').innerHTML = `
+                            ${UI.createCard(t('reports.stats.revenue'), `$${totalAmount2.toLocaleString()}`, 'TWD', 'bg-white')}
+                            ${UI.createCard(t('reports.stats.qty'), totalQty2, '')}
+                            ${UI.createCard(t('reports.stats.orders'), filtered2.length, '')}
+                        `;
+                    }
+                });
                 const resultsContainer = document.getElementById('report-results');
                 if (Object.keys(branchGroups).length === 0) {
                     resultsContainer.innerHTML = `<div class="text-center py-10 text-slate-400">${t('reports.noData')}</div>`;
@@ -1057,7 +1164,8 @@
                                         ${data.orders.map(o => {
                                             const orderTotal = o.items.reduce((acc, i) => {
                                                 const p = products.find(prod => prod.id === i.productId);
-                                                return acc + (p ? p.price * i.quantity : 0);
+                                                const price = p ? p.price : (typeof i.price === 'number' ? i.price : 0);
+                                                return acc + price * i.quantity;
                                             }, 0);
                                             return `
                                             <div class="bg-white p-4 rounded-lg border border-slate-200 shadow-sm ml-4 border-l-4 ${o.status==='pending'?'border-l-yellow-400':o.status==='shipped'?'border-l-blue-400':'border-l-green-400'}">
@@ -1074,7 +1182,9 @@
                                                 <div class="text-xs text-slate-500 space-y-1 pl-2 border-l-2 border-slate-100">
                                                     ${o.items.map(i => {
                                                         const p = products.find(prod => prod.id === i.productId);
-                                                        return `<div class="flex justify-between"><span>${p ? p.name : '未知'} x ${i.quantity}</span><span>$${(p ? p.price * i.quantity : 0).toLocaleString()}</span></div>`;
+                                                        const price = p ? p.price : (typeof i.price === 'number' ? i.price : 0);
+                                                        const displayName = p ? p.name : (i.name || '');
+                                                        return `<div class="flex justify-between"><span>${displayName} x ${i.quantity}</span><span>$${(price * i.quantity).toLocaleString()}</span></div>`;
                                                     }).join('')}
                                                 </div>
                                             </div>`;
@@ -1195,18 +1305,19 @@
                 filteredOrders.forEach(o => {
                     o.items.forEach(item => {
                         const p = products.find(prod => prod.id === item.productId);
-                        if (!p) return;
                         const unitCost = store.getCost(o.date, item.productId);
-                        const sales = p.price * item.quantity;
+                        const price = p ? p.price : (typeof item.price === 'number' ? item.price : 0);
+                        const sales = price * item.quantity;
                         const costVal = unitCost * item.quantity;
                         const profitVal = sales - costVal;
                         if (!profitData[item.productId]) {
-                            profitData[item.productId] = { name: p.name, sku: p.sku, qty: 0, sales: 0, cost: 0, profit: 0 };
+                            profitData[item.productId || (item.name || '') + (item.sku || '')] = { name: p ? p.name : (item.name || ''), sku: p ? p.sku : (item.sku || ''), qty: 0, sales: 0, cost: 0, profit: 0 };
                         }
-                        profitData[item.productId].qty += item.quantity;
-                        profitData[item.productId].sales += sales;
-                        profitData[item.productId].cost += costVal;
-                        profitData[item.productId].profit += profitVal;
+                        const key = item.productId || (item.name || '') + (item.sku || '');
+                        profitData[key].qty += item.quantity;
+                        profitData[key].sales += sales;
+                        profitData[key].cost += costVal;
+                        profitData[key].profit += profitVal;
                         sumSales += sales;
                         sumCost += costVal;
                         sumProfit += profitVal;
@@ -1703,7 +1814,8 @@
                     const d = new Date(dateStr);
                     d.setHours(12,0,0,0);
                     const dateISO = d.toISOString();
-                    store.createOrder(branch, items, dateISO);
+                    const created = store.createOrder(branch, items, dateISO);
+                    if (created) sendOrderToGoogleSheets(created);
                     alert(t('orders.branch.success'));
                     e.target.reset();
                     customInput.classList.add('hidden');
@@ -1975,5 +2087,4 @@
         }
         new App();
     </script>
-</body>
-</html>
+</body
