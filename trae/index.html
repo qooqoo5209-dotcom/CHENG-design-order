@@ -1,0 +1,1979 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LogiFlow - 物流總倉管理系統</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#2563eb',
+                        secondary: '#475569',
+                        success: '#16a34a',
+                        warning: '#ca8a04',
+                        danger: '#dc2626'
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { font-family: 'Inter', system-ui, -apple-system, sans-serif; background-color: #f1f5f9; }
+        .fade-in { animation: fadeIn 0.25s ease-in-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+    <meta name="color-scheme" content="light">
+</head>
+<body class="text-slate-800 h-screen flex flex-col overflow-hidden">
+    <div id="app" class="flex h-full w-full">
+        <aside id="sidebar-container" class="hidden md:flex flex-col w-64 bg-slate-900 text-white h-full"></aside>
+        <main class="flex-1 flex flex-col h-full overflow-hidden relative">
+            <header id="mobile-header" class="md:hidden bg-slate-900 text-white p-4 flex justify-between items-center shadow-md z-20">
+                <h1 class="font-bold text-lg">LogiFlow</h1>
+                <button id="mobile-menu-btn" class="p-1"><i data-lucide="menu"></i></button>
+            </header>
+            <div id="mobile-menu-overlay" class="fixed inset-0 bg-black/50 z-30 hidden md:hidden"></div>
+            <div id="mobile-menu" class="fixed inset-y-0 left-0 w-64 bg-slate-900 text-white transform -translate-x-full transition-transform z-40 md:hidden flex flex-col"></div>
+            <div id="main-content" class="flex-1 overflow-auto p-4 md:p-8 relative"></div>
+        </main>
+    </div>
+    <div id="modal-container"></div>
+
+    <script>
+        const STORAGE_KEY = 'logiflow_data_v1';
+        const INITIAL_DATA = {
+            products: [
+                { id: 'p1', name: '標準紙箱 (大)', sku: 'BOX-L-001', category: '包材', stock: 500, safetyStock: 100, price: 15 },
+                { id: 'p2', name: '封箱膠帶', sku: 'TP-CLR-002', category: '包材', stock: 120, safetyStock: 50, price: 25 },
+                { id: 'p3', name: '氣泡布捲', sku: 'BUB-003', category: '緩衝材', stock: 45, safetyStock: 20, price: 200 },
+                { id: 'p4', name: '標籤貼紙 (熱感應)', sku: 'LBL-TH-004', category: '耗材', stock: 300, safetyStock: 50, price: 120 },
+                { id: 'p5', name: '物流棧板 (塑膠)', sku: 'PLT-P-005', category: '設備', stock: 30, safetyStock: 10, price: 800 }
+            ],
+            orders: [
+                { id: 'o1', branch: '台北信義店', date: new Date(Date.now() - 86400000).toISOString(), status: 'completed', items: [{ productId: 'p1', quantity: 50 }, { productId: 'p2', quantity: 10 }] },
+                { id: 'o2', branch: '台中中港店', date: new Date().toISOString(), status: 'pending', items: [{ productId: 'p3', quantity: 5 }, { productId: 'p4', quantity: 20 }] }
+            ],
+            costs: [],
+            settings: { currentRole: 'hq', language: 'zh' }
+        };
+
+        class Store {
+            constructor() {
+                this.data = this.load();
+                this.listeners = [];
+                this.undoStack = [];
+                if (!Array.isArray(this.data.costs)) this.data.costs = [];
+            }
+            normalizeDayISO(input) {
+                const d = new Date(input || new Date());
+                d.setHours(12, 0, 0, 0);
+                return d.toISOString();
+            }
+            setCost(dateISO, productId, cost) {
+                if (!Array.isArray(this.data.costs)) this.data.costs = [];
+                const day = this.normalizeDayISO(dateISO);
+                const idx = this.data.costs.findIndex(c => c.productId === productId && this.normalizeDayISO(c.date) === day);
+                if (idx >= 0) {
+                    this.data.costs[idx].cost = parseFloat(cost) || 0;
+                } else {
+                    this.data.costs.push({ id: 'c' + Date.now() + productId, productId, date: day, cost: parseFloat(cost) || 0 });
+                }
+                this.save();
+            }
+            getCost(dateISO, productId) {
+                if (!Array.isArray(this.data.costs)) return 0;
+                const day = this.normalizeDayISO(dateISO);
+                const entry = this.data.costs.find(c => c.productId === productId && this.normalizeDayISO(c.date) === day);
+                return entry ? (parseFloat(entry.cost) || 0) : 0;
+            }
+            getCostsByDate(dateISO) {
+                if (!Array.isArray(this.data.costs)) return [];
+                const day = this.normalizeDayISO(dateISO);
+                return this.data.costs.filter(c => this.normalizeDayISO(c.date) === day);
+            }
+            removeCost(dateISO, productId) {
+                if (!Array.isArray(this.data.costs)) return null;
+                const day = this.normalizeDayISO(dateISO);
+                const idx = this.data.costs.findIndex(c => c.productId === productId && this.normalizeDayISO(c.date) === day);
+                if (idx === -1) return null;
+                const [removed] = this.data.costs.splice(idx, 1);
+                this.save();
+                return removed;
+            }
+            load() {
+                try {
+                    const stored = localStorage.getItem(STORAGE_KEY);
+                    return stored ? JSON.parse(stored) : JSON.parse(JSON.stringify(INITIAL_DATA));
+                } catch (e) {
+                    console.error('Data load error:', e);
+                    localStorage.removeItem(STORAGE_KEY);
+                    return JSON.parse(JSON.stringify(INITIAL_DATA));
+                }
+            }
+            save() {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(this.data));
+                this.notify();
+            }
+            subscribe(callback) { this.listeners.push(callback); }
+            notify() { this.listeners.forEach(cb => cb(this.data)); }
+            getProducts() { return this.data.products; }
+            addProduct(product) { this.data.products.push({ ...product, id: 'p' + Date.now() }); this.save(); }
+            deleteProduct(id) { this.data.products = this.data.products.filter(p => p.id !== id); this.save(); }
+            updateProduct(id, updates) {
+                this.data.products = this.data.products.map(p => p.id === id ? { ...p, ...updates } : p);
+                this.save();
+            }
+            adjustStock(id, amount) {
+                this.data.products = this.data.products.map(p => {
+                    if (p.id === id) {
+                        const newStock = p.stock + amount;
+                        return { ...p, stock: newStock < 0 ? 0 : newStock };
+                    }
+                    return p;
+                });
+                this.save();
+            }
+            getOrders() { return this.data.orders.sort((a, b) => new Date(b.date) - new Date(a.date)); }
+            createOrder(branch, items, dateISO = null) {
+                this.data.orders.unshift({
+                    id: 'o' + Date.now(),
+                    branch,
+                    date: this.normalizeDayISO(dateISO || new Date()),
+                    status: 'pending',
+                    items
+                });
+                this.save();
+            }
+            updateOrderStatus(orderId, status) {
+                const order = this.data.orders.find(o => o.id === orderId);
+                if (!order) return;
+                if (order.status === 'pending' && status === 'shipped') {
+                    let possible = true;
+                    for (const item of order.items) {
+                        const product = this.data.products.find(p => p.id === item.productId);
+                        if (!product || product.stock < item.quantity) {
+                            possible = false;
+                            alert(`庫存不足: ${product ? product.name : '未知商品'}`);
+                            break;
+                        }
+                    }
+                    if (possible) {
+                        order.items.forEach(item => this.adjustStock(item.productId, -item.quantity));
+                        order.status = status;
+                        this.save();
+                    }
+                } else {
+                    order.status = status;
+                    this.save();
+                }
+            }
+            removeOrderItem(orderId, productId) {
+                const order = this.data.orders.find(o => o.id === orderId);
+                if (!order) return null;
+                const idx = order.items.findIndex(i => i.productId === productId);
+                if (idx === -1) return null;
+                const [item] = order.items.splice(idx, 1);
+                this.undoStack.push({ type: 'item_delete', orderId, item });
+                this.save();
+                return item;
+            }
+            updateOrderItemQuantity(orderId, productId, quantity) {
+                const order = this.data.orders.find(o => o.id === orderId);
+                if (!order) return null;
+                const item = order.items.find(i => i.productId === productId);
+                if (!item) return null;
+                const prev = item.quantity;
+                const newQty = Math.max(0, parseInt(quantity) || 0);
+                item.quantity = newQty;
+                if (order.status !== 'pending') {
+                    const delta = newQty - prev;
+                    this.adjustStock(productId, -delta);
+                }
+                this.undoStack.push({ type: 'qty_update', orderId, productId, prevQty: prev });
+                this.save();
+                return { prev, newQty };
+            }
+            deleteOrder(orderId) {
+                const idx = this.data.orders.findIndex(o => o.id === orderId);
+                if (idx === -1) return null;
+                const [deleted] = this.data.orders.splice(idx, 1);
+                this.undoStack.push({ type: 'delete', orders: [deleted] });
+                this.save();
+                return deleted;
+            }
+            deleteOrdersByBranchInRange(branch, startISO, endISO) {
+                const start = new Date(startISO);
+                const end = new Date(endISO);
+                end.setHours(23, 59, 59, 999);
+                const toDelete = this.data.orders.filter(o => o.branch === branch && new Date(o.date) >= start && new Date(o.date) <= end);
+                if (toDelete.length === 0) return 0;
+                const ids = new Set(toDelete.map(o => o.id));
+                this.data.orders = this.data.orders.filter(o => !ids.has(o.id));
+                this.undoStack.push({ type: 'bulk_delete', orders: toDelete });
+                this.save();
+                return toDelete.length;
+            }
+            undoLast() {
+                const action = this.undoStack.pop();
+                if (!action) return 0;
+                if (action.type === 'item_delete') {
+                    const order = this.data.orders.find(o => o.id === action.orderId);
+                    if (!order) return 0;
+                    order.items.push(action.item);
+                    this.save();
+                    return 1;
+                } else if (action.type === 'qty_update') {
+                    const order = this.data.orders.find(o => o.id === action.orderId);
+                    if (!order) return 0;
+                    const item = order.items.find(i => i.productId === action.productId);
+                    if (!item) return 0;
+                    item.quantity = action.prevQty;
+                    this.save();
+                    return 1;
+                } else {
+                    const restored = action.orders || [];
+                    this.data.orders.unshift(...restored);
+                    this.save();
+                    return restored.length;
+                }
+            }
+            setRole(role) { this.data.settings.currentRole = role; this.save(); }
+            getRole() { return this.data.settings.currentRole; }
+            setReportPreset(preset) { this.data.settings.reportPreset = preset; this.save(); }
+            getReportPreset() { return this.data.settings.reportPreset || null; }
+            clearReportPreset() { delete this.data.settings.reportPreset; this.save(); }
+            setCostsDatePreset(dateISO) { this.data.settings.costsDatePreset = dateISO; this.save(); }
+            getCostsDatePreset() { return this.data.settings.costsDatePreset || null; }
+            clearCostsDatePreset() { delete this.data.settings.costsDatePreset; this.save(); }
+            setLanguage(lang) { this.data.settings.language = (lang === 'vi' ? 'vi' : 'zh'); this.save(); }
+            getLanguage() { return this.data.settings.language || 'zh'; }
+        }
+        const store = new Store();
+    </script>
+
+    <script>
+        const I18N = {
+            zh: {
+                nav: {
+                    dashboard: '總覽看板',
+                    inventory: '庫存管理',
+                    orders_hq: '訂單管理',
+                    orders_branch: '分店叫貨',
+                    reports: '結帳統整',
+                    costs: '成本管理'
+                },
+                dashboard: {
+                    title: '總覽看板',
+                    subtitle: '物流中心實時數據監控',
+                    latest: '最新訂單動態',
+                    viewAll: '查看全部',
+                    cards: {
+                        inventoryItems: '在庫商品項',
+                        lowStock: '低庫存預警',
+                        pendingOrders: '待處理訂單',
+                        totalValue: '庫存總值'
+                    },
+                    headers: {
+                        orderId: '訂單編號',
+                        branch: '分店',
+                        amount: '金額',
+                        status: '狀態',
+                        time: '時間'
+                    },
+                    orderButton: '分店叫貨'
+                },
+                status: {
+                    completed: '已完成',
+                    shipped: '已出貨',
+                    pending: '待處理'
+                },
+                inventory: {
+                    title: '庫存管理',
+                    subtitle: '當前共有 {count} 項商品 SKU',
+                    addBulk: '批量新增商品',
+                    headers: {
+                        nameSku: '商品名稱 / SKU',
+                        stockQty: '現有庫存',
+                        price: '單價',
+                        actions: '操作'
+                    },
+                    labels: {
+                        lowStock: '低於安全量',
+                        viewOnly: '僅查看'
+                    },
+                    modal: {
+                        bulkTitle: '批量新增商品',
+                        guideTitle: '使用說明',
+                        guide1: '請直接貼上 Word/Excel 內容，每行一項商品。',
+                        example: '支援格式範例：',
+                        successAdd: '成功新增 {count} 項商品！',
+                        confirmDelete: '確定刪除？',
+                        in: '入庫',
+                        out: '出庫',
+                        bulkFieldLabel: '商品清單貼上區',
+                        bulkPlaceholder: '大紙箱 15\\n封箱膠帶 25\\n氣泡布捲 200',
+                        currentLabel: '當前',
+                        quantityLabel: '數量'
+                    }
+                },
+                orders: {
+                    hq: {
+                        title: '訂單管理',
+                        subtitle: '處理分店補貨請求',
+                        total: '總計',
+                        itemsHeader: '品項 (數量)',
+                        subtotal: '小計',
+                        confirmDeleteItem: '確定刪除此品項？',
+                        deletedOneItem: '已刪除 1 個品項',
+                        ship: '確認出貨',
+                        complete: '標記完成',
+                        confirmDeleteOrder: '確定刪除訂單？',
+                        deletedOneOrder: '已刪除 1 筆訂單'
+                    },
+                    branch: {
+                        title: '分店叫貨',
+                        subtitle: '提交補貨申請',
+                        selectBranch: '選擇分店',
+                        customOption: '自行填寫...',
+                        customPlaceholder: '請輸入店家名稱',
+                        orderDate: '下單日期',
+                        submit: '提交訂單',
+                        selectItems: '商品選購',
+                        inputQtyHint: '請在需要的商品後方輸入數量',
+                        stockLabel: '庫存',
+                        totalItems: '已選購項目',
+                        totalAmount: '預估總額',
+                        success: '訂單提交成功！',
+                        fillBranchWarn: '請填寫店家名稱',
+                        warnSelectItems: '請至少選擇一項商品'
+                    }
+                },
+                reports: {
+                    title: '結帳統整',
+                    subtitle: '分店進貨數據統計與對帳',
+                    profitTitle: '菜錢成本與淨利分析',
+                    goCosts: '前往成本管理',
+                    startDateLabel: '開始日期',
+                    endDateLabel: '結束日期',
+                    branchFilterLabel: '分店篩選',
+                    allBranchesOption: '所有分店',
+                    monthSuffix: '月',
+                    stats: {
+                        revenue: '區間總營收',
+                        qty: '總出貨數量',
+                        orders: '總訂單數'
+                    },
+                    noData: '此區間無訂單資料',
+                    branchTotal: '分店總計',
+                    aggTitle: '商品匯總表',
+                    dailyTitle: '每日叫貨明細',
+                    branchLabel: '分店',
+                    productLabel: '商品',
+                    adjustQty: '調整商品數量',
+                    undoUpdated: '已更新 {count} 筆數量',
+                    confirmDeleteRange: '確定刪除「{branch}」在當前篩選區間內的所有訂單？',
+                    rangeLabel: '區間',
+                    aggHeaders: {
+                        qtyTotal: '總數量',
+                        amountTotal: '總金額'
+                    },
+                    profit: {
+                        sales: '總銷售額',
+                        cost: '總成本',
+                        net: '總淨利',
+                        margin: '毛利率'
+                    }
+                },
+                costs: {
+                    title: '成本管理',
+                    subtitle: '輸入每日商品進貨成本價',
+                    goReports: '前往結帳統整',
+                    empty: '尚未設定任何成本',
+                    addConfirm: '確定新增',
+                    warnSelectProduct: '請先選擇商品',
+                    deletedOne: '已刪除 1 個成本項目',
+                    todayList: '今日成本清單',
+                    selectProductLabel: '選擇商品',
+                    inputCostPlaceholder: '進貨成本'
+                },
+                buttons: {
+                    printAgg: '列印商品匯總表',
+                    printDaily: '列印每日叫貨明細',
+                    save: '儲存',
+                    delete: '刪除'
+                },
+                table: {
+                    product: '商品',
+                    quantity: '數量',
+                    cost: '成本',
+                    profit: '淨利',
+                    date: '日期',
+                    order: '訂單',
+                    subtotal: '小計'
+                },
+                langLabel: '語言',
+                role: {
+                    currentView: '當前視角',
+                    hq: '總倉管理員',
+                    branch: '分店店長',
+                    switch: '切換'
+                },
+                alerts: {
+                    hqOnly: '此頁面僅限總倉管理員瀏覽，已返回分店叫貨頁',
+                    adminVerify: '管理員驗證',
+                    adminPwdPlaceholder: '請輸入管理員密碼',
+                    adminPwdWrong: '密碼錯誤'
+                }
+            },
+            vi: {
+                nav: {
+                    dashboard: 'Tổng quan',
+                    inventory: 'Quản lý tồn kho',
+                    orders_hq: 'Quản lý đơn',
+                    orders_branch: 'Đặt hàng chi nhánh',
+                    reports: 'Đối chiếu',
+                    costs: 'Quản lý chi phí'
+                },
+                dashboard: {
+                    title: 'Tổng quan',
+                    subtitle: 'Giám sát dữ liệu kho trung tâm theo thời gian',
+                    latest: 'Đơn hàng mới nhất',
+                    viewAll: 'Xem tất cả',
+                    cards: {
+                        inventoryItems: 'Sản phẩm tồn kho',
+                        lowStock: 'Cảnh báo tồn thấp',
+                        pendingOrders: 'Đơn chờ xử lý',
+                        totalValue: 'Giá trị tồn kho'
+                    },
+                    headers: {
+                        orderId: 'Mã đơn',
+                        branch: 'Chi nhánh',
+                        amount: 'Số tiền',
+                        status: 'Trạng thái',
+                        time: 'Thời gian'
+                    },
+                    orderButton: 'Đặt hàng chi nhánh'
+                },
+                status: {
+                    completed: 'Hoàn tất',
+                    shipped: 'Đã xuất kho',
+                    pending: 'Chờ xử lý'
+                },
+                inventory: {
+                    title: 'Quản lý tồn kho',
+                    subtitle: 'Hiện có {count} sản phẩm SKU',
+                    addBulk: 'Thêm sản phẩm hàng loạt',
+                    headers: {
+                        nameSku: 'Tên sản phẩm / SKU',
+                        stockQty: 'Số lượng tồn',
+                        price: 'Đơn giá',
+                        actions: 'Thao tác'
+                    },
+                    labels: {
+                        lowStock: 'Thấp hơn mức an toàn',
+                        viewOnly: 'Chỉ xem'
+                    },
+                    modal: {
+                        bulkTitle: 'Thêm sản phẩm hàng loạt',
+                        guideTitle: 'Hướng dẫn',
+                        guide1: 'Dán nội dung từ Word/Excel, mỗi dòng một sản phẩm.',
+                        example: 'Ví dụ hỗ trợ:',
+                        successAdd: 'Đã thêm {count} sản phẩm!',
+                        confirmDelete: 'Xác nhận xóa?',
+                        in: 'Nhập kho',
+                        out: 'Xuất kho',
+                        bulkFieldLabel: 'Dán danh sách sản phẩm',
+                        bulkPlaceholder: 'Thùng giấy lớn 15\\nBăng keo 25\\nCuộn chống sốc 200',
+                        currentLabel: 'Hiện tại',
+                        quantityLabel: 'Số lượng'
+                    }
+                },
+                orders: {
+                    hq: {
+                        title: 'Quản lý đơn',
+                        subtitle: 'Xử lý yêu cầu bổ sung hàng từ chi nhánh',
+                        total: 'Tổng cộng',
+                        itemsHeader: 'Mặt hàng (Số lượng)',
+                        subtotal: 'Tạm tính',
+                        confirmDeleteItem: 'Xác nhận xóa mặt hàng?',
+                        deletedOneItem: 'Đã xóa 1 mặt hàng',
+                        ship: 'Xác nhận xuất kho',
+                        complete: 'Đánh dấu hoàn tất',
+                        confirmDeleteOrder: 'Xác nhận xóa đơn hàng?',
+                        deletedOneOrder: 'Đã xóa 1 đơn hàng'
+                    },
+                    branch: {
+                        title: 'Đặt hàng chi nhánh',
+                        subtitle: 'Gửi yêu cầu bổ sung hàng',
+                        selectBranch: 'Chọn chi nhánh',
+                        customOption: 'Tự nhập...',
+                        customPlaceholder: 'Nhập tên cửa hàng',
+                        orderDate: 'Ngày đặt',
+                        submit: 'Gửi đơn hàng',
+                        selectItems: 'Chọn sản phẩm',
+                        inputQtyHint: 'Nhập số lượng ở phía sau sản phẩm',
+                        stockLabel: 'Tồn kho',
+                        totalItems: 'Mặt hàng đã chọn',
+                        totalAmount: 'Tổng ước tính',
+                        success: 'Đã gửi đơn hàng!',
+                        fillBranchWarn: 'Vui lòng điền tên cửa hàng',
+                        warnSelectItems: 'Vui lòng chọn ít nhất một sản phẩm'
+                    }
+                },
+                reports: {
+                    title: 'Đối chiếu',
+                    subtitle: 'Thống kê dữ liệu nhập hàng và đối chiếu',
+                    profitTitle: 'Phân tích chi phí và lợi nhuận',
+                    goCosts: 'Tới quản lý chi phí',
+                    startDateLabel: 'Ngày bắt đầu',
+                    endDateLabel: 'Ngày kết thúc',
+                    branchFilterLabel: 'Lọc chi nhánh',
+                    allBranchesOption: 'Tất cả chi nhánh',
+                    monthSuffix: 'Tháng',
+                    stats: {
+                        revenue: 'Doanh thu trong khoảng',
+                        qty: 'Tổng số lượng xuất',
+                        orders: 'Tổng số đơn'
+                    },
+                    noData: 'Không có dữ liệu trong khoảng này',
+                    branchTotal: 'Tổng chi nhánh',
+                    aggTitle: 'Bảng tổng hợp sản phẩm',
+                    dailyTitle: 'Chi tiết đặt hàng hằng ngày',
+                    branchLabel: 'Chi nhánh',
+                    productLabel: 'Sản phẩm',
+                    adjustQty: 'Điều chỉnh số lượng',
+                    undoUpdated: 'Đã cập nhật {count} mục',
+                    confirmDeleteRange: 'Xác nhận xóa tất cả đơn của “{branch}” trong khoảng hiện tại?',
+                    rangeLabel: 'Khoảng',
+                    aggHeaders: {
+                        qtyTotal: 'Tổng số lượng',
+                        amountTotal: 'Tổng số tiền'
+                    },
+                    profit: {
+                        sales: 'Tổng doanh thu',
+                        cost: 'Tổng chi phí',
+                        net: 'Lợi nhuận ròng',
+                        margin: 'Biên lợi nhuận'
+                    }
+                },
+                costs: {
+                    title: 'Quản lý chi phí',
+                    subtitle: 'Nhập giá vốn hàng ngày theo sản phẩm',
+                    goReports: 'Tới đối chiếu',
+                    empty: 'Chưa có chi phí nào',
+                    addConfirm: 'Xác nhận thêm',
+                    warnSelectProduct: 'Vui lòng chọn sản phẩm',
+                    deletedOne: 'Đã xóa 1 chi phí',
+                    todayList: 'Danh sách chi phí hôm nay',
+                    selectProductLabel: 'Chọn sản phẩm',
+                    inputCostPlaceholder: 'Giá vốn'
+                },
+                buttons: {
+                    printAgg: 'In bảng tổng hợp',
+                    printDaily: 'In chi tiết đặt hàng hằng ngày',
+                    save: 'Lưu',
+                    delete: 'Xóa'
+                },
+                table: {
+                    product: 'Sản phẩm',
+                    quantity: 'Số lượng',
+                    cost: 'Chi phí',
+                    profit: 'Lợi nhuận',
+                    date: 'Ngày',
+                    order: 'Đơn hàng',
+                    subtotal: 'Tạm tính'
+                },
+                langLabel: 'Ngôn ngữ',
+                role: {
+                    currentView: 'Chế độ hiện tại',
+                    hq: 'Quản trị kho trung tâm',
+                    branch: 'Quản lý chi nhánh',
+                    switch: 'Chuyển'
+                },
+                alerts: {
+                    hqOnly: 'Trang này chỉ dành cho quản trị kho trung tâm, đã quay lại trang đặt hàng chi nhánh',
+                    adminVerify: 'Xác thực quản trị',
+                    adminPwdPlaceholder: 'Nhập mật khẩu quản trị',
+                    adminPwdWrong: 'Sai mật khẩu'
+                }
+            }
+        };
+        const t = (key) => {
+            const lang = store.getLanguage();
+            const parts = key.split('.');
+            let cur = I18N[lang] || I18N.zh;
+            for (const p of parts) {
+                if (cur && typeof cur === 'object' && p in cur) cur = cur[p];
+                else {
+                    let def = I18N.zh; for (const q of parts) { if (def && q in def) def = def[q]; else return key; }
+                    return def || key;
+                }
+            }
+            return typeof cur === 'string' ? cur : key;
+        };
+        const tf = (key, params = {}) => {
+            let s = t(key);
+            Object.keys(params).forEach(k => { s = s.replace(new RegExp('\\{' + k + '\\}', 'g'), params[k]); });
+            return s;
+        };
+        const applyI18n = (root = document) => {
+            root.querySelectorAll('[data-i18n]').forEach(el => {
+                const key = el.getAttribute('data-i18n');
+                el.textContent = t(key);
+            });
+            root.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+                const key = el.getAttribute('data-i18n-placeholder');
+                el.setAttribute('placeholder', t(key));
+            });
+        };
+    </script>
+
+    <script>
+        if (typeof CostsView === 'undefined') {
+            class CostsView {
+                constructor(storeInstance) {
+                    this.store = storeInstance;
+                    this.state = { date: new Date().toISOString().slice(0,10) };
+                }
+                render(container) {
+                    const html = `
+                        <div class="max-w-4xl mx-auto pb-20">
+                            <div class="mb-4 flex items-center justify-between">
+                                <div>
+                                    <h2 class="text-2xl font-bold text-slate-800">成本管理 (簡化模式)</h2>
+                                    <p class="text-slate-500">原模組載入失敗，已啟用後備版本</p>
+                                </div>
+                            </div>
+                            <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-4 space-y-4">
+                                <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+                                    <input type="date" id="cost-date" class="border border-slate-300 rounded-lg p-2 text-sm bg-white" value="${this.state.date}">
+                                    <select id="cost-product" class="border border-slate-300 rounded-lg p-2 text-sm bg-white"></select>
+                                    <input type="number" id="cost-amount" min="0" step="0.01" class="w-full border-b border-slate-300 focus:border-blue-500 focus:outline-none bg-transparent p-1" placeholder="進貨成本">
+                                    <button id="cost-add" class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">確定新增</button>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                    container.innerHTML = html;
+                    const products = (this.store && this.store.getProducts) ? this.store.getProducts() : [];
+                    const select = container.querySelector('#cost-product');
+                    if (select) {
+                        select.innerHTML = '<option value="">選擇商品</option>' + products.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+                    }
+                    const dateEl = container.querySelector('#cost-date');
+                    if (dateEl) dateEl.addEventListener('change', e => { this.state.date = e.target.value; });
+                    const addBtn = container.querySelector('#cost-add');
+                    if (addBtn) addBtn.addEventListener('click', () => {
+                        const pid = (container.querySelector('#cost-product') || {}).value || '';
+                        const amountInput = container.querySelector('#cost-amount');
+                        const val = amountInput ? parseFloat(amountInput.value) : NaN;
+                        if (!pid) { alert('請先選擇商品'); return; }
+                        const amount = isNaN(val) ? 0 : val;
+                        if (this.store && this.store.setCost) this.store.setCost(this.state.date, pid, amount);
+                        alert('已新增成本');
+                    });
+                }
+            }
+            window.CostsView = CostsView;
+        }
+    </script>
+
+    <script>
+        const UI = {
+            createCard(title, value, subtext = '', colorClass = 'bg-white') {
+                return `
+                    <div class="${colorClass} p-6 rounded-xl shadow-sm border border-slate-100">
+                        <div class="text-slate-500 text-sm font-medium uppercase tracking-wider mb-1">${title}</div>
+                        <div class="text-3xl font-bold text-slate-800">${value}</div>
+                        ${subtext ? `<div class="text-xs text-slate-400 mt-2">${subtext}</div>` : ''}
+                    </div>
+                `;
+            },
+            createBadge(text, type = 'default') {
+                const styles = {
+                    default: 'bg-slate-100 text-slate-800',
+                    success: 'bg-green-100 text-green-800',
+                    warning: 'bg-yellow-100 text-yellow-800',
+                    danger: 'bg-red-100 text-red-800',
+                    blue: 'bg-blue-100 text-blue-800'
+                };
+                return `<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${styles[type] || styles.default}">${text}</span>`;
+            },
+            showModal(title, contentHTML, onConfirm = null) {
+                const container = document.getElementById('modal-container');
+                container.innerHTML = `
+                    <div class="fixed inset-0 z-50 overflow-y-auto">
+                        <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
+                            <div class="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity" onclick="document.getElementById('modal-container').innerHTML=''"></div>
+                            <span class="hidden sm:inline-block sm:align-middle sm:h-screen">&#8203;</span>
+                            <div class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg w-full">
+                                <div class="bg-white px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
+                                    <h3 class="text-lg leading-6 font-medium text-gray-900 mb-4">${title}</h3>
+                                    <div class="mt-2">${contentHTML}</div>
+                                </div>
+                                <div class="bg-gray-50 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
+                                    ${onConfirm ? `<button type="button" id="modal-confirm-btn" class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-blue-600 text-base font-medium text-white hover:bg-blue-700 sm:ml-3 sm:w-auto sm:text-sm">確認</button>` : ''}
+                                    <button type="button" class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 shadow-sm px-4 py-2 bg-white text-base font-medium text-gray-700 hover:bg-gray-50 sm:mt-0 sm:ml-3 sm:w-auto sm:text-sm" onclick="document.getElementById('modal-container').innerHTML=''">取消</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                if (onConfirm) {
+                    document.getElementById('modal-confirm-btn').addEventListener('click', () => {
+                        onConfirm();
+                        document.getElementById('modal-container').innerHTML = '';
+                    });
+                }
+            },
+            showUndo(text, onUndo) {
+                const el = document.createElement('div');
+                el.className = 'fixed bottom-6 right-6 z-50';
+                el.innerHTML = `
+                    <div class="bg-slate-900 text-white px-4 py-3 rounded-xl shadow-lg flex items-center gap-3">
+                        <span class="text-sm">${text}</span>
+                        <button class="px-3 py-1 rounded bg-blue-600 hover:bg-blue-700 text-sm">復原</button>
+                    </div>
+                `;
+                document.body.appendChild(el);
+                const btn = el.querySelector('button');
+                const remove = () => { if (el.parentNode) el.parentNode.removeChild(el); };
+                btn.addEventListener('click', () => { onUndo(); remove(); });
+                setTimeout(remove, 8000);
+            }
+        };
+    </script>
+
+    <script>
+        const DashboardView = {
+            render(container) {
+                const products = store.getProducts();
+                const orders = store.getOrders();
+                const totalProducts = products.length;
+                const lowStockCount = products.filter(p => p.stock <= p.safetyStock).length;
+                const pendingOrders = orders.filter(o => o.status === 'pending').length;
+                const totalValue = products.reduce((acc, p) => acc + (p.stock * p.price), 0);
+                const isHQ = store.getRole() === 'hq';
+
+                const html = `
+                    <div class="fade-in">
+                        <div class="mb-8 flex justify-between items-center">
+                            <div>
+                                <h2 class="text-2xl font-bold text-slate-800" data-i18n="dashboard.title">${t('dashboard.title')}</h2>
+                                <p class="text-slate-500" data-i18n="dashboard.subtitle">${t('dashboard.subtitle')}</p>
+                            </div>
+                            <div class="flex items-center gap-3">
+                                <button id="dashboard-order-btn" class="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 shadow-sm transition-colors"><i data-lucide='shopping-cart' class='w-4 h-4'></i> ${t('dashboard.orderButton')}</button>
+                                <div class="text-sm bg-blue-50 text-blue-700 px-3 py-1 rounded-lg">${new Date().toLocaleDateString()}</div>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+                            ${UI.createCard(t('dashboard.cards.inventoryItems'), totalProducts, 'SKU')}
+                            ${UI.createCard(t('dashboard.cards.lowStock'), lowStockCount, '', lowStockCount > 0 ? 'bg-red-50 border-red-100' : 'bg-white')}
+                            ${UI.createCard(t('dashboard.cards.pendingOrders'), pendingOrders, '', pendingOrders > 0 ? 'bg-yellow-50 border-yellow-100' : 'bg-white')}
+                            ${UI.createCard(t('dashboard.cards.totalValue'), `$${totalValue.toLocaleString()}`, 'TWD')}
+                        </div>
+                        <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+                            <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center">
+                                <h3 class="font-bold text-slate-800" data-i18n="dashboard.latest">${t('dashboard.latest')}</h3>
+                                <button class="text-sm text-blue-600 hover:text-blue-800" onclick="window.location.hash='#orders'">${t('dashboard.viewAll')}</button>
+                            </div>
+                            <div class="overflow-x-auto">
+                                <table class="min-w-full divide-y divide-slate-200">
+                                    <thead class="bg-slate-50">
+                                        <tr>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">${t('dashboard.headers.orderId')}</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">${t('dashboard.headers.branch')}</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">${t('dashboard.headers.amount')}</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">${t('dashboard.headers.status')}</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">${t('dashboard.headers.time')}</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="bg-white divide-y divide-slate-200">
+                                        ${orders.slice(0, 5).map(order => {
+                                            const total = order.items.reduce((acc, i) => {
+                                                const p = products.find(p => p.id === i.productId);
+                                                return acc + (p ? p.price * i.quantity : 0);
+                                            }, 0);
+                                            return `
+                                            <tr>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-slate-900">#${order.id.slice(-6)}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-slate-500">${order.branch}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-slate-900 font-medium">$${total.toLocaleString()}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm">${UI.createBadge(order.status === 'completed' ? t('status.completed') : order.status === 'shipped' ? t('status.shipped') : t('status.pending'), order.status === 'completed' ? 'success' : order.status === 'shipped' ? 'blue' : 'warning')}</td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-slate-500">${new Date(order.date).toLocaleDateString()}</td>
+                                            </tr>`;
+                                        }).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                container.innerHTML = html;
+                applyI18n(container);
+                const orderBtn = container.querySelector('#dashboard-order-btn');
+                if (orderBtn) {
+                    orderBtn.addEventListener('click', () => {
+                        if (store.getRole() === 'hq') {
+                            store.setRole('branch');
+                        }
+                        window.location.hash = '#orders';
+                    });
+                }
+                if (window.lucide) window.lucide.createIcons();
+            }
+        };
+
+        const ReportsView = {
+            state: {
+                start: new Date().toISOString().slice(0, 8) + '01',
+                end: new Date().toISOString().slice(0, 10),
+                branch: 'all'
+            },
+            render(container) {
+                const preset = store.getReportPreset();
+                if (preset) {
+                    this.state.start = preset.start || this.state.start;
+                    this.state.end = preset.end || this.state.end;
+                    this.state.branch = preset.branch || 'all';
+                    store.clearReportPreset();
+                }
+                const branches = [...new Set(store.getOrders().map(o => o.branch))];
+                const html = `
+                    <div class="fade-in max-w-5xl mx-auto pb-20">
+                        <div class="mb-6">
+                            <h2 class="text-2xl font-bold text-slate-800" data-i18n="reports.title">${t('reports.title')}</h2>
+                            <p class="text-slate-500" data-i18n="reports.subtitle">${t('reports.subtitle')}</p>
+                        </div>
+                        <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-100 mb-6">
+                            <div class="flex flex-col gap-4">
+                                <div class="flex flex-wrap gap-2">
+                                    ${Array.from({length: 12}, (_, i) => i + 1).map(m => `
+                                        <button class="btn-month px-3 py-1 text-sm rounded-full border border-slate-200 hover:bg-blue-50 hover:border-blue-200 hover:text-blue-600 transition-colors ${this.isCurrentMonth(m) ? 'bg-blue-600 text-white border-blue-600 hover:bg-blue-700 hover:text-white' : 'text-slate-600'}" data-month="${m}">${m}${t('reports.monthSuffix')}</button>
+                                    `).join('')}
+                                </div>
+                                <div class="flex flex-col md:flex-row gap-4 items-end">
+                                    <div class="flex-1 w-full grid grid-cols-2 gap-4">
+                                        <div>
+                                            <label class="block text-xs font-medium text-slate-500 mb-1" data-i18n="reports.startDateLabel">${t('reports.startDateLabel')}</label>
+                                            <input type="date" id="report-start" class="w-full border border-slate-300 rounded-lg p-2 text-sm" value="${this.state.start}">
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-medium text-slate-500 mb-1" data-i18n="reports.endDateLabel">${t('reports.endDateLabel')}</label>
+                                            <input type="date" id="report-end" class="w-full border border-slate-300 rounded-lg p-2 text-sm" value="${this.state.end}">
+                                        </div>
+                                    </div>
+                                    <div class="w-full md:w-64">
+                                        <label class="block text-xs font-medium text-slate-500 mb-1" data-i18n="reports.branchFilterLabel">${t('reports.branchFilterLabel')}</label>
+                                        <select id="report-branch" class="w-full border border-slate-300 rounded-lg p-2 text-sm bg-white">
+                                            <option value="all">${t('reports.allBranchesOption')}</option>
+                                            ${branches.map(b => `<option value="${b}" ${this.state.branch === b ? 'selected' : ''}>${b}</option>`).join('')}
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="report-stats" class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6"></div>
+                        <div id="report-results" class="space-y-4"></div>
+                        <div id="profit-summary" class="mt-8 space-y-4">
+                            <div class="px-4 py-3 bg-white rounded-xl border border-slate-100 font-bold text-slate-700 flex items-center justify-between">
+                                <div class="flex items-center gap-2">
+                                    <i data-lucide="percent" class="w-4 h-4"></i> ${t('reports.profitTitle')}
+                                </div>
+                                <button id="link-to-costs" class="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded">${t('reports.goCosts')}</button>
+                            </div>
+                            <div class="grid grid-cols-1 md:grid-cols-4 gap-6" id="profit-cards"></div>
+                            <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+                            <div class="px-4 py-3 bg-slate-100 border-b border-slate-200 font-bold text-slate-700 flex items-center gap-2">
+                                <i data-lucide="table" class="w-4 h-4"></i> ${t('table.cost')}
+                            </div>
+                                <div class="overflow-x-auto">
+                                    <table class="min-w-full divide-y divide-slate-200">
+                                        <thead class="bg-slate-50">
+                                            <tr>
+                                                <th class="px-4 py-2 text-left text-xs font-medium text-slate-500 uppercase">${t('table.product')} / SKU</th>
+                                                <th class="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">${t('table.quantity')}</th>
+                                                <th class="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">總銷售額</th>
+                                                <th class="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">${t('table.cost')}</th>
+                                                <th class="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">${t('table.profit')}</th>
+                                                <th class="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">毛利率</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="profit-table-body" class="divide-y divide-slate-200"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                container.innerHTML = html;
+                this.bindEvents(container);
+                this.updateView();
+                const btnLinkCosts = container.querySelector('#link-to-costs');
+                if (btnLinkCosts) btnLinkCosts.addEventListener('click', () => {
+                    store.setCostsDatePreset(this.state.start);
+                    window.location.hash = '#costs';
+                });
+                applyI18n(container);
+            },
+            isCurrentMonth(m) {
+                const d = new Date(this.state.start);
+                return (d.getMonth() + 1) === m && d.getFullYear() === new Date().getFullYear();
+            },
+            bindEvents(container) {
+                container.querySelectorAll('.btn-month').forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        const m = parseInt(btn.dataset.month);
+                        const y = new Date().getFullYear();
+                        const start = new Date(y, m - 1, 1);
+                        const end = new Date(y, m, 0);
+                        this.state.start = start.toISOString().split('T')[0];
+                        this.state.end = end.toISOString().split('T')[0];
+                        container.querySelector('#report-start').value = this.state.start;
+                        container.querySelector('#report-end').value = this.state.end;
+                        container.querySelectorAll('.btn-month').forEach(b => {
+                            b.className = `btn-month px-3 py-1 text-sm rounded-full border border-slate-200 hover:bg-blue-50 hover:border-blue-200 hover:text-blue-600 transition-colors text-slate-600`;
+                        });
+                        btn.className = `btn-month px-3 py-1 text-sm rounded-full border border-blue-600 bg-blue-600 text-white hover:bg-blue-700 hover:text-white transition-colors`;
+                        this.updateView();
+                    });
+                });
+                container.querySelector('#report-start').addEventListener('change', e => { this.state.start = e.target.value; this.updateView(); });
+                container.querySelector('#report-end').addEventListener('change', e => { this.state.end = e.target.value; this.updateView(); });
+                container.querySelector('#report-branch').addEventListener('change', e => { this.state.branch = e.target.value; this.updateView(); });
+            },
+            updateView() {
+                const orders = store.getOrders();
+                const products = store.getProducts();
+                const start = new Date(this.state.start);
+                const end = new Date(this.state.end);
+                end.setHours(23, 59, 59, 999);
+                const filteredOrders = orders.filter(o => {
+                    const d = new Date(o.date);
+                    const matchDate = d >= start && d <= end;
+                    const matchBranch = this.state.branch === 'all' || o.branch === this.state.branch;
+                    return matchDate && matchBranch;
+                });
+                let totalAmount = 0;
+                let totalItems = 0;
+                let totalQty = 0;
+                const branchGroups = {};
+                filteredOrders.forEach(o => {
+                    if (!branchGroups[o.branch]) branchGroups[o.branch] = { orders: [], products: {} };
+                    branchGroups[o.branch].orders.push(o);
+                    o.items.forEach(item => {
+                        const p = products.find(prod => prod.id === item.productId);
+                        if (!p) return;
+                        const price = p.price;
+                        const cost = price * item.quantity;
+                        totalAmount += cost;
+                        totalQty += item.quantity;
+                        totalItems++;
+                        if (!branchGroups[o.branch].products[item.productId]) {
+                            branchGroups[o.branch].products[item.productId] = { name: p.name, sku: p.sku, qty: 0, amount: 0 };
+                        }
+                        branchGroups[o.branch].products[item.productId].qty += item.quantity;
+                        branchGroups[o.branch].products[item.productId].amount += cost;
+                    });
+                });
+                this.currentGroups = branchGroups;
+                this.currentProducts = products;
+                document.getElementById('report-stats').innerHTML = `
+                    ${UI.createCard(t('reports.stats.revenue'), `$${totalAmount.toLocaleString()}`, 'TWD', 'bg-white')}
+                    ${UI.createCard(t('reports.stats.qty'), totalQty, '')}
+                    ${UI.createCard(t('reports.stats.orders'), filteredOrders.length, '')}
+                `;
+                const resultsContainer = document.getElementById('report-results');
+                if (Object.keys(branchGroups).length === 0) {
+                    resultsContainer.innerHTML = `<div class="text-center py-10 text-slate-400">${t('reports.noData')}</div>`;
+                } else {
+                    resultsContainer.innerHTML = Object.entries(branchGroups).map(([branchName, data]) => {
+                        const branchTotal = Object.values(data.products).reduce((acc, p) => acc + p.amount, 0);
+                        return `
+                        <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden group">
+                            <details class="w-full">
+                                <summary class="list-none flex items-center justify-between p-6 cursor-pointer bg-white hover:bg-slate-50 transition-colors select-none">
+                                    <div class="flex items-center gap-4">
+                                        <div class="p-2 bg-blue-50 text-blue-600 rounded-lg"><i data-lucide="store" class="w-5 h-5"></i></div>
+                                        <div>
+                                            <h3 class="font-bold text-slate-800 text-lg">${branchName}</h3>
+                                            <p class="text-sm text-slate-500">${data.orders.length} 筆訂單</p>
+                                        </div>
+                                    </div>
+                                    <div class="flex items-center gap-4">
+                                        <div class="text-right">
+                                            <div class="text-sm text-slate-500">${t('reports.branchTotal')}</div>
+                                            <div class="text-xl font-bold text-slate-800">$${branchTotal.toLocaleString()}</div>
+                                        </div>
+                                        <button class="btn-delete-branch text-slate-400 hover:text-red-600" data-branch="${branchName}"><i data-lucide="trash-2"></i></button>
+                                        <div class="text-slate-400 transform transition-transform duration-200 group-open:rotate-180"><i data-lucide="chevron-down"></i></div>
+                                    </div>
+                                </summary>
+                                <div class="border-t border-slate-100 bg-slate-50 p-6">
+                                    <div class="flex justify-end gap-2 mb-4">
+                                        <button class="btn-print-agg bg-blue-600 hover:bg-blue-700 text-white text-xs px-3 py-1.5 rounded" data-branch="${branchName}">${t('buttons.printAgg')}</button>
+                                        <button class="btn-print-daily bg-blue-600 hover:bg-blue-700 text-white text-xs px-3 py-1.5 rounded" data-branch="${branchName}">${t('buttons.printDaily')}</button>
+                                    </div>
+                                    <div class="bg-white rounded-lg border border-slate-200 overflow-hidden mb-6">
+                                        <div class="px-4 py-3 bg-slate-100 border-b border-slate-200 font-bold text-slate-700 flex items-center gap-2">
+                                            <i data-lucide="package-check" class="w-4 h-4"></i> ${t('reports.aggTitle')}
+                                        </div>
+                                        <table class="min-w-full divide-y divide-slate-200">
+                                            <thead class="bg-slate-50">
+                                                <tr>
+                                                    <th class="px-4 py-2 text-left text-xs font-medium text-slate-500 uppercase">${t('table.product')} / SKU</th>
+                                                    <th class="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">${t('reports.aggHeaders.qtyTotal')}</th>
+                                                    <th class="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">${t('reports.aggHeaders.amountTotal')}</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody class="divide-y divide-slate-200">
+                                                ${Object.entries(data.products).map(([pid, p]) => `
+                                                    <tr>
+                                                        <td class="px-4 py-2 text-sm text-slate-800">
+                                                            <div class="flex items-center justify-between">
+                                                                <div>
+                                                                    ${p.name}
+                                                                    <span class="text-xs text-slate-400 block">${p.sku}</span>
+                                                                </div>
+                                                                <button class="btn-edit-agg text-slate-400 hover:text-blue-600" data-branch="${branchName}" data-pid="${pid}"><i data-lucide="pencil" class="w-4 h-4"></i></button>
+                                                            </div>
+                                                        </td>
+                                                        <td class="px-4 py-2 text-sm text-slate-800 text-right font-medium">${p.qty}</td>
+                                                        <td class="px-4 py-2 text-sm text-slate-800 text-right font-medium">$${p.amount.toLocaleString()}</td>
+                                                    </tr>
+                                                `).join('')}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    <div class="space-y-3">
+                                        <div class="px-1 py-2 font-bold text-slate-700 flex items-center gap-2">
+                                            <i data-lucide="calendar-clock" class="w-4 h-4"></i> ${t('reports.dailyTitle')}
+                                        </div>
+                                        ${data.orders.map(o => {
+                                            const orderTotal = o.items.reduce((acc, i) => {
+                                                const p = products.find(prod => prod.id === i.productId);
+                                                return acc + (p ? p.price * i.quantity : 0);
+                                            }, 0);
+                                            return `
+                                            <div class="bg-white p-4 rounded-lg border border-slate-200 shadow-sm ml-4 border-l-4 ${o.status==='pending'?'border-l-yellow-400':o.status==='shipped'?'border-l-blue-400':'border-l-green-400'}">
+                                                <div class="flex justify-between items-start mb-2">
+                                                    <div>
+                                                        <span class="text-xs font-mono text-slate-400 bg-slate-100 px-1 rounded">#${o.id.slice(-6)}</span>
+                                                        <span class="text-sm font-medium text-slate-700 ml-2">${new Date(o.date).toLocaleDateString()} ${new Date(o.date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+                                                    </div>
+                                                    <div class="flex items-center gap-2">
+                                                        <div class="text-sm font-bold text-slate-800">$${orderTotal.toLocaleString()}</div>
+                                                        <button class="btn-delete-order-report text-slate-400 hover:text-red-600" data-id="${o.id}"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                                                    </div>
+                                                </div>
+                                                <div class="text-xs text-slate-500 space-y-1 pl-2 border-l-2 border-slate-100">
+                                                    ${o.items.map(i => {
+                                                        const p = products.find(prod => prod.id === i.productId);
+                                                        return `<div class="flex justify-between"><span>${p ? p.name : '未知'} x ${i.quantity}</span><span>$${(p ? p.price * i.quantity : 0).toLocaleString()}</span></div>`;
+                                                    }).join('')}
+                                                </div>
+                                            </div>`;
+                                        }).join('')}
+                                    </div>
+                                </div>
+                            </details>
+                        </div>`;
+                    }).join('');
+                    const resultsEl = document.getElementById('report-results');
+                    resultsEl.querySelectorAll('.btn-delete-branch').forEach(btn => btn.addEventListener('click', (e) => {
+                        const branch = e.currentTarget.dataset.branch;
+                        if (confirm(tf('reports.confirmDeleteRange', { branch }))) {
+                            const count = store.deleteOrdersByBranchInRange(branch, this.state.start, this.state.end);
+                            this.updateView();
+                            if (count > 0) UI.showUndo(`已刪除 ${count} 筆訂單`, () => {
+                                const restored = store.undoLast();
+                                if (restored) this.updateView();
+                            });
+                        }
+                    }));
+                    resultsEl.querySelectorAll('.btn-edit-agg').forEach(btn => btn.addEventListener('click', () => {
+                        const branch = btn.dataset.branch;
+                        const pid = btn.dataset.pid;
+                        const p = products.find(x => x.id === pid);
+                        const orders = store.getOrders().filter(o => {
+                            const d = new Date(o.date);
+                            const start = new Date(this.state.start);
+                            const end = new Date(this.state.end); end.setHours(23,59,59,999);
+                            const matchBranch = o.branch === branch;
+                            const matchDate = d >= start && d <= end;
+                            const hasItem = o.items.some(i => i.productId === pid);
+                            return matchBranch && matchDate && hasItem;
+                        });
+                        const rows = orders.map(o => {
+                            const item = o.items.find(i => i.productId === pid);
+                            const price = p ? p.price : 0;
+                            const subtotal = price * (item ? item.quantity : 0);
+                            return `
+                                <tr>
+                                    <td class="px-4 py-2 text-sm">#${o.id.slice(-6)}</td>
+                                    <td class="px-4 py-2 text-sm">${new Date(o.date).toLocaleDateString()}</td>
+                                    <td class="px-4 py-2 text-sm text-right">
+                                        <input type="number" min="0" value="${item ? item.quantity : 0}" data-oid="${o.id}" class="w-20 border rounded p-1 text-right">
+                                    </td>
+                                    <td class="px-4 py-2 text-sm text-right">$${subtotal.toLocaleString()}</td>
+                                </tr>
+                            `;
+                        }).join('');
+                        const content = `
+                            <div class="space-y-3">
+                                <div class="text-sm text-slate-700">${t('reports.branchLabel')}：<span class="font-bold">${branch}</span></div>
+                                <div class="text-sm text-slate-700">${t('reports.productLabel')}：<span class="font-bold">${p ? p.name : '未知商品'}</span> <span class="text-xs text-slate-400">${p ? p.sku : ''}</span></div>
+                                <div class="overflow-x-auto border rounded">
+                                    <table class="min-w-full divide-y divide-slate-200">
+                                        <thead class="bg-slate-50">
+                                            <tr>
+                                                <th class="px-4 py-2 text-left text-xs text-slate-500 uppercase">${t('table.order')}</th>
+                                                <th class="px-4 py-2 text-left text-xs text-slate-500 uppercase">${t('table.date')}</th>
+                                                <th class="px-4 py-2 text-right text-xs text-slate-500 uppercase">${t('table.quantity')}</th>
+                                                <th class="px-4 py-2 text-right text-xs text-slate-500 uppercase">${t('table.subtotal')}</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody class="divide-y divide-slate-200">
+                                            ${rows || `<tr><td class="px-4 py-3 text-center text-slate-400" colspan="4">${t('reports.noData')}</td></tr>`}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        `;
+                        UI.showModal(t('reports.adjustQty'), content, () => {
+                            const inputs = document.querySelectorAll('input[data-oid]');
+                            let updated = 0;
+                            inputs.forEach(input => {
+                                const oid = input.dataset.oid;
+                                const val = parseInt(input.value) || 0;
+                                const order = store.getOrders().find(o => o.id === oid);
+                                if (!order) return;
+                                const item = order.items.find(i => i.productId === pid);
+                                if (!item) return;
+                                if (val !== item.quantity) {
+                                    store.updateOrderItemQuantity(oid, pid, val);
+                                    updated++;
+                                }
+                            });
+                            this.updateView();
+                            if (updated > 0) {
+                                UI.showUndo(tf('reports.undoUpdated', { count: updated }), () => {
+                                    for (let i = 0; i < updated; i++) store.undoLast();
+                                    this.updateView();
+                                });
+                            }
+                        });
+                    }));
+                    resultsEl.querySelectorAll('.btn-print-agg').forEach(btn => btn.addEventListener('click', (e) => {
+                        const branch = e.currentTarget.dataset.branch;
+                        const html = ReportsView.buildAggPrintHTML.call(ReportsView, branch);
+                        ReportsView.printHTML(html);
+                    }));
+                    resultsEl.querySelectorAll('.btn-print-daily').forEach(btn => btn.addEventListener('click', (e) => {
+                        const branch = e.currentTarget.dataset.branch;
+                        const html = ReportsView.buildDailyPrintHTML.call(ReportsView, branch);
+                        ReportsView.printHTML(html);
+                    }));
+                    if (window.lucide) window.lucide.createIcons();
+                }
+                const profitCardsEl = document.getElementById('profit-cards');
+                const profitTableBodyEl = document.getElementById('profit-table-body');
+                if (!filteredOrders.length) {
+                    profitCardsEl.innerHTML = '';
+                    profitTableBodyEl.innerHTML = '';
+                    return;
+                }
+                let sumSales = 0;
+                let sumCost = 0;
+                let sumProfit = 0;
+                const profitData = {};
+                filteredOrders.forEach(o => {
+                    o.items.forEach(item => {
+                        const p = products.find(prod => prod.id === item.productId);
+                        if (!p) return;
+                        const unitCost = store.getCost(o.date, item.productId);
+                        const sales = p.price * item.quantity;
+                        const costVal = unitCost * item.quantity;
+                        const profitVal = sales - costVal;
+                        if (!profitData[item.productId]) {
+                            profitData[item.productId] = { name: p.name, sku: p.sku, qty: 0, sales: 0, cost: 0, profit: 0 };
+                        }
+                        profitData[item.productId].qty += item.quantity;
+                        profitData[item.productId].sales += sales;
+                        profitData[item.productId].cost += costVal;
+                        profitData[item.productId].profit += profitVal;
+                        sumSales += sales;
+                        sumCost += costVal;
+                        sumProfit += profitVal;
+                    });
+                });
+                profitCardsEl.innerHTML = `
+                    ${UI.createCard(t('reports.profit.sales'), `$${sumSales.toLocaleString()}`, '')}
+                    ${UI.createCard(t('reports.profit.cost'), `$${sumCost.toLocaleString()}`, '')}
+                    ${UI.createCard(t('reports.profit.net'), `$${sumProfit.toLocaleString()}`, '')}
+                    ${UI.createCard(t('reports.profit.margin'), (sumSales > 0 ? ((sumProfit / sumSales) * 100).toFixed(2) + '%' : '0.00%'), '')}
+                `;
+                profitTableBodyEl.innerHTML = Object.values(profitData).map(d => `
+                    <tr>
+                        <td class="px-4 py-2 text-sm">
+                            <div class="text-slate-800 font-medium">${d.name}</div>
+                            <div class="text-xs text-slate-400">${d.sku}</div>
+                        </td>
+                        <td class="px-4 py-2 text-sm text-right">${d.qty}</td>
+                        <td class="px-4 py-2 text-sm text-right">$${d.sales.toLocaleString()}</td>
+                        <td class="px-4 py-2 text-sm text-right">$${d.cost.toLocaleString()}</td>
+                        <td class="px-4 py-2 text-sm text-right text-green-600">$${d.profit.toLocaleString()}</td>
+                        <td class="px-4 py-2 text-sm text-right">${d.sales > 0 ? ((d.profit / d.sales) * 100).toFixed(2) + '%' : '0.00%'}</td>
+                    </tr>
+                `).join('');
+            },
+            buildAggPrintHTML(branch) {
+                const group = this.currentGroups && this.currentGroups[branch] ? this.currentGroups[branch] : { products: {} };
+                const title = `${t('reports.aggTitle')}（${branch}）`;
+                const range = `${t('reports.rangeLabel')}：${this.state.start} 至 ${this.state.end}`;
+                const rows = Object.values(group.products).map(p => `
+                    <tr>
+                        <td>${p.name}${p.sku ? ' (' + p.sku + ')' : ''}</td>
+                        <td style="text-align:right">${p.qty}</td>
+                        <td style="text-align:right">$${p.amount.toLocaleString()}</td>
+                    </tr>
+                `).join('');
+                const html = `
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="utf-8">
+                    <title>${title}</title>
+                    <style>
+                        @media print {
+                            * { margin:0; padding:0; box-shadow:none !important; background:transparent !important; }
+                            body { font-size:12pt; font-family:'MingLiU','PMingLiU','DFKai-SB','新細明體','標楷體','Courier New',Courier,monospace; color:#000; }
+                            table { border-collapse:collapse; width:100%; }
+                            th, td { border:1px solid #000; padding:0; }
+                            h1, h2, h3 { font-weight:700; }
+                            .report-page { page-break-after: always; }
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="report-page">
+                        <h2>${title}</h2>
+                        <div>${range}</div>
+                        <table>
+                            <thead>
+                                <tr><th>${t('table.product')} / SKU</th><th style="text-align:right">${t('reports.aggHeaders.qtyTotal')}</th><th style="text-align:right">${t('reports.aggHeaders.amountTotal')}</th></tr>
+                            </thead>
+                            <tbody>${rows || `<tr><td colspan="3">${t('reports.noData')}</td></tr>`}</tbody>
+                        </table>
+                    </div>
+                </body>
+                </html>
+                `;
+                return html;
+            },
+            buildDailyPrintHTML(branch) {
+                const group = this.currentGroups && this.currentGroups[branch] ? this.currentGroups[branch] : { orders: [] };
+                const products = this.currentProducts || [];
+                const title = `${t('reports.dailyTitle')}（${branch}）`;
+                const range = `${t('reports.rangeLabel')}：${this.state.start} 至 ${this.state.end}`;
+                const days = {};
+                (group.orders || []).forEach(o => {
+                    const k = new Date(o.date).toISOString().slice(0,10);
+                    if (!days[k]) days[k] = [];
+                    days[k].push(o);
+                });
+                const sections = Object.entries(days).sort((a,b) => new Date(a[0]) - new Date(b[0])).map(([day, os]) => {
+                    const rows = os.map(o => o.items.map(i => {
+                        const p = products.find(x => x.id === i.productId);
+                        const price = p ? p.price : 0;
+                        const amount = price * i.quantity;
+                        return `
+                            <tr>
+                                <td>#${o.id.slice(-6)}</td>
+                                <td>${p ? p.name : ''}${p && p.sku ? ' (' + p.sku + ')' : ''}</td>
+                                <td style="text-align:right">${i.quantity}</td>
+                                <td style="text-align:right">$${amount.toLocaleString()}</td>
+                            </tr>
+                        `;
+                    }).join('')).join('');
+                    return `
+                        <h3>${day}</h3>
+                        <table>
+                            <thead>
+                                <tr><th>${t('table.order')}</th><th>${t('table.product')} / SKU</th><th style="text-align:right">${t('table.quantity')}</th><th style="text-align:right">${t('table.subtotal')}</th></tr>
+                            </thead>
+                            <tbody>${rows || `<tr><td colspan="4">${t('reports.noData')}</td></tr>`}</tbody>
+                        </table>
+                    `;
+                }).join('');
+                const html = `
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="utf-8">
+                    <title>${title}</title>
+                    <style>
+                        @media print {
+                            * { margin:0; padding:0; box-shadow:none !important; background:transparent !important; }
+                            body { font-size:12pt; font-family:'MingLiU','PMingLiU','DFKai-SB','新細明體','標楷體','Courier New',Courier,monospace; color:#000; }
+                            table { border-collapse:collapse; width:100%; }
+                            th, td { border:1px solid #000; padding:0; }
+                            h1, h2, h3 { font-weight:700; }
+                            .report-page { page-break-after: always; }
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="report-page">
+                        <h2>${title}</h2>
+                        <div>${range}</div>
+                        ${sections || `<div>${t('reports.noData')}</div>`}
+                    </div>
+                </body>
+                </html>
+                `;
+                return html;
+            },
+            printHTML(html) {
+                const iframe = document.createElement('iframe');
+                iframe.style.position = 'fixed';
+                iframe.style.right = '0';
+                iframe.style.bottom = '0';
+                iframe.style.width = '0';
+                iframe.style.height = '0';
+                iframe.style.border = '0';
+                document.body.appendChild(iframe);
+                const doc = iframe.contentDocument || iframe.contentWindow.document;
+                doc.open();
+                doc.write(html);
+                doc.close();
+                const done = () => { setTimeout(() => { if (iframe.parentNode) iframe.parentNode.removeChild(iframe); }, 1000); };
+                iframe.onload = () => { iframe.contentWindow.focus(); iframe.contentWindow.print(); done(); };
+            }
+        };
+
+        const InventoryView = {
+            render(container) {
+                const products = store.getProducts();
+                const isHQ = store.getRole() === 'hq';
+                const html = `
+                    <div class="fade-in pb-20">
+                        <div class="mb-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                            <div>
+                                <h2 class="text-2xl font-bold text-slate-800" data-i18n="inventory.title">${t('inventory.title')}</h2>
+                                <p class="text-slate-500">${tf('inventory.subtitle', { count: products.length })}</p>
+                            </div>
+                            ${isHQ ? `<button id="btn-add-product" class="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 shadow-sm"><i data-lucide="plus"></i> ${t('inventory.addBulk')}</button>` : ''}
+                        </div>
+                        <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+                            <div class="overflow-x-auto">
+                                <table class="min-w-full divide-y divide-slate-200">
+                                    <thead class="bg-slate-50">
+                                        <tr>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">${t('inventory.headers.nameSku')}</th>
+                                            <th class="px-6 py-3 text-right text-xs font-medium text-slate-500 uppercase tracking-wider">${t('inventory.headers.stockQty')}</th>
+                                            <th class="px-6 py-3 text-right text-xs font-medium text-slate-500 uppercase tracking-wider">${t('inventory.headers.price')}</th>
+                                            <th class="px-6 py-3 text-right text-xs font-medium text-slate-500 uppercase tracking-wider">${t('inventory.headers.actions')}</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="bg-white divide-y divide-slate-200">
+                                        ${products.map(p => {
+                                            const isLow = p.stock <= p.safetyStock;
+                                            return `
+                                            <tr>
+                                                <td class="px-6 py-4 whitespace-nowrap">
+                                                    ${isHQ ? `
+                                                        <input type="text" class="edit-name w-full border-b border-transparent hover:border-blue-300 focus:border-blue-500 focus:outline-none bg-transparent font-medium text-slate-900 text-sm mb-1" value="${p.name}" data-id="${p.id}">
+                                                    ` : `<div class="text-sm font-medium text-slate-900">${p.name}</div>`}
+                                                    <div class="text-xs text-slate-500">${p.sku}</div>
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-right">
+                                                    <div class="text-sm font-bold ${isLow ? 'text-red-600' : 'text-slate-900'}">${p.stock}</div>
+                                                    ${isLow ? `<div class="text-xs text-red-500">${t('inventory.labels.lowStock')}</div>` : ''}
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-right text-sm text-slate-500">
+                                                    ${isHQ ? `
+                                                        <div class="flex items-center justify-end gap-1">
+                                                            <span>$</span>
+                                                            <input type="number" min="0" class="edit-price w-20 text-right border-b border-transparent hover:border-blue-300 focus:border-blue-500 focus:outline-none bg-transparent" value="${p.price}" data-id="${p.id}">
+                                                        </div>
+                                                    ` : `$${p.price}`}
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                                    ${isHQ ? `
+                                                        <button class="btn-stock-in text-green-600 hover:text-green-900 mr-3" data-id="${p.id}">${t('inventory.modal.in')}</button>
+                                                        <button class="btn-stock-out text-red-600 hover:text-red-900 mr-3" data-id="${p.id}">${t('inventory.modal.out')}</button>
+                                                        <button class="btn-delete text-slate-400 hover:text-red-600" data-id="${p.id}"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                                                    ` : `<span class="text-xs text-slate-400">${t('inventory.labels.viewOnly')}</span>`}
+                                                </td>
+                                            </tr>`;
+                                        }).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                container.innerHTML = html;
+                if (isHQ) {
+                    document.getElementById('btn-add-product').addEventListener('click', () => this.openAddModal());
+                    document.querySelectorAll('.btn-stock-in').forEach(btn => btn.addEventListener('click', (e) => this.openStockModal(e.target.dataset.id, 'in')));
+                    document.querySelectorAll('.btn-stock-out').forEach(btn => btn.addEventListener('click', (e) => this.openStockModal(e.target.dataset.id, 'out')));
+                    document.querySelectorAll('.btn-delete').forEach(btn => btn.addEventListener('click', (e) => {
+                        if(confirm(t('inventory.modal.confirmDelete'))) store.deleteProduct(e.currentTarget.dataset.id);
+                    }));
+                    const updateProduct = (id, field, value) => { store.updateProduct(id, { [field]: value }); };
+                    container.querySelectorAll('.edit-name').forEach(input => {
+                        input.addEventListener('change', e => updateProduct(e.target.dataset.id, 'name', e.target.value));
+                    });
+                    container.querySelectorAll('.edit-price').forEach(input => {
+                        input.addEventListener('change', e => updateProduct(e.target.dataset.id, 'price', parseFloat(e.target.value) || 0));
+                    });
+                }
+                if (window.lucide) window.lucide.createIcons();
+                applyI18n(container);
+            },
+            openAddModal() {
+                const formHtml = `
+                    <div class="space-y-4">
+                        <div class="bg-blue-50 text-blue-800 p-3 rounded-lg text-sm">
+                            <p class="font-bold mb-1"><i data-lucide="info" class="w-4 h-4 inline mr-1"></i> ${t('inventory.modal.guideTitle')}</p>
+                            <p>${t('inventory.modal.guide1')}</p>
+                            <p class="mt-1 text-xs text-blue-600">${t('inventory.modal.example')}<span class="font-mono bg-blue-100 px-1">大紙箱 15</span></p>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1" data-i18n="inventory.modal.bulkFieldLabel">${t('inventory.modal.bulkFieldLabel')}</label>
+                            <textarea id="bulk-input" rows="10" class="w-full border-gray-300 rounded-lg shadow-sm border p-3 font-mono text-sm" placeholder="${t('inventory.modal.bulkPlaceholder').replace(/\\n/g, '&#10;')}" data-i18n-placeholder="inventory.modal.bulkPlaceholder"></textarea>
+                        </div>
+                    </div>
+                `;
+                UI.showModal(t('inventory.modal.bulkTitle'), formHtml, () => {
+                    const text = document.getElementById('bulk-input').value;
+                    if (!text.trim()) return;
+                    const lines = text.split(/\n/);
+                    let count = 0;
+                    lines.forEach(line => {
+                        line = line.trim();
+                        if (!line) return;
+                        const parts = line.split(/[\t\s,]+/);
+                        let price = 0;
+                        let nameParts = [];
+                        parts.forEach(part => {
+                            if (!isNaN(part) && part !== '') price = parseFloat(part);
+                            else nameParts.push(part);
+                        });
+                        const name = nameParts.join(' ');
+                        if (name) {
+                            store.addProduct({
+                                name,
+                                sku: 'SKU-' + Date.now().toString().slice(-6) + Math.floor(Math.random() * 1000),
+                                category: '一般',
+                                stock: 0,
+                                safetyStock: 0,
+                                price: price
+                            });
+                            count++;
+                        }
+                    });
+                    alert(tf('inventory.modal.successAdd', { count }));
+                    InventoryView.render(document.getElementById('main-content'));
+                });
+            },
+            openStockModal(id, type) {
+                const p = store.getProducts().find(p => p.id === id);
+                UI.showModal(type === 'in' ? `${t('inventory.modal.in')}: ${p.name}` : `${t('inventory.modal.out')}: ${p.name}`,
+                    `<div class="mb-4">${t('inventory.modal.currentLabel')}: ${p.stock}</div><label>${t('inventory.modal.quantityLabel')}</label><input type="number" id="stock-amount" min="1" value="1" class="w-full border p-2 rounded">`,
+                    () => {
+                        const val = +document.getElementById('stock-amount').value;
+                        if(val > 0) store.adjustStock(id, type === 'in' ? val : -val);
+                    }
+                );
+            }
+        };
+
+        const OrdersView = {
+            render(container) {
+                if (store.getRole() === 'hq') this.renderHQ(container);
+                else this.renderBranch(container);
+            },
+            renderHQ(container) {
+                const orders = store.getOrders();
+                const products = store.getProducts();
+                const html = `
+                    <div class="fade-in max-w-3xl mx-auto">
+                        <div class="mb-6"><h2 class="text-2xl font-bold text-slate-800" data-i18n="orders.hq.title">${t('orders.hq.title')}</h2><p class="text-slate-500" data-i18n="orders.hq.subtitle">${t('orders.hq.subtitle')}</p></div>
+                        ${orders.map(o => {
+                            const totalAmount = o.items.reduce((acc, i) => {
+                                const p = products.find(p => p.id === i.productId);
+                                return acc + (p ? p.price * i.quantity : 0);
+                            }, 0);
+                            return `
+                            <div class="bg-white rounded-lg shadow-sm border border-slate-100 mb-4 p-4 border-l-4 ${o.status==='pending'?'border-yellow-400':o.status==='shipped'?'border-blue-400':'border-green-400'}">
+                                <div class="flex justify-between items-start mb-3">
+                                    <div>
+                                        <div class="font-bold text-lg text-slate-800">${o.branch}</div>
+                                        <div class="text-xs text-slate-400">#${o.id.slice(-6)} • ${new Date(o.date).toLocaleString()}</div>
+                                    </div>
+                                    <div class="text-right">
+                                        ${UI.createBadge(o.status==='completed'?t('status.completed'):o.status==='shipped'?t('status.shipped'):t('status.pending'), o.status==='completed'?'success':o.status==='shipped'?'blue':'warning')}
+                                        <div class="flex items-center justify-end gap-2 mt-1">
+                                            <div class="text-sm font-bold text-slate-700">${t('orders.hq.total')}: $${totalAmount.toLocaleString()}</div>
+                                            <button class="btn-delete-order text-slate-400 hover:text-red-600" data-id="${o.id}"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="bg-slate-50 rounded p-3 mb-4 space-y-2">
+                                    <div class="flex justify-between text-xs text-slate-400 border-b border-slate-200 pb-1 mb-1">
+                                        <span>${t('orders.hq.itemsHeader')}</span>
+                                        <span>${t('orders.hq.subtotal')}</span>
+                                    </div>
+                                    ${o.items.map(i => {
+                                        const p = products.find(p => p.id === i.productId);
+                                        const subtotal = p ? p.price * i.quantity : 0;
+                                        return `
+                                        <div class="flex justify-between text-sm text-slate-600">
+                                            <span>${p ? p.name : '未知商品'} <span class="text-slate-400 text-xs">x${i.quantity}</span></span>
+                                            <span class="flex items-center gap-2">
+                                                <span class="font-medium">$${subtotal.toLocaleString()}</span>
+                                                <button class="btn-delete-item text-slate-400 hover:text-red-600" data-oid="${o.id}" data-pid="${i.productId}"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                                            </span>
+                                        </div>`;
+                                    }).join('')}
+                                </div>
+                                <div class="flex justify-end gap-2">
+                                    ${o.status === 'pending' ? `<button class="btn-ship text-sm bg-blue-600 text-white px-3 py-1.5 rounded" data-id="${o.id}">${t('orders.hq.ship')}</button>` : ''}
+                                    ${o.status === 'shipped' ? `<button class="btn-complete text-sm bg-green-600 text-white px-3 py-1.5 rounded" data-id="${o.id}">${t('orders.hq.complete')}</button>` : ''}
+                                </div>
+                            </div>
+                        `}).join('')}
+                    </div>
+                `;
+                container.innerHTML = html;
+                container.querySelectorAll('.btn-ship').forEach(b => b.addEventListener('click', e => store.updateOrderStatus(e.target.dataset.id, 'shipped')));
+                container.querySelectorAll('.btn-complete').forEach(b => b.addEventListener('click', e => store.updateOrderStatus(e.target.dataset.id, 'completed')));
+                container.querySelectorAll('.btn-delete-order').forEach(b => b.addEventListener('click', e => {
+                    const id = e.currentTarget.dataset.id;
+                    if (confirm(t('orders.hq.confirmDeleteOrder'))) {
+                        const deleted = store.deleteOrder(id);
+                        OrdersView.render(document.getElementById('main-content'));
+                        if (deleted) UI.showUndo(t('orders.hq.deletedOneOrder'), () => {
+                            const restored = store.undoLast();
+                            if (restored) OrdersView.render(document.getElementById('main-content'));
+                        });
+                    }
+                }));
+                container.querySelectorAll('.btn-delete-item').forEach(b => b.addEventListener('click', e => {
+                    const oid = e.currentTarget.dataset.oid;
+                    const pid = e.currentTarget.dataset.pid;
+                    if (confirm(t('orders.hq.confirmDeleteItem'))) {
+                        const removed = store.removeOrderItem(oid, pid);
+                        OrdersView.render(document.getElementById('main-content'));
+                        if (removed) UI.showUndo(t('orders.hq.deletedOneItem'), () => {
+                            const restored = store.undoLast();
+                            if (restored) OrdersView.render(document.getElementById('main-content'));
+                        });
+                    }
+                }));
+                applyI18n(container);
+            },
+            renderBranch(container) {
+                const products = store.getProducts();
+                const categories = {};
+                products.forEach(p => {
+                    if (!categories[p.category]) categories[p.category] = [];
+                    categories[p.category].push(p);
+                });
+                const branchOptions = [
+                    '大社旺堡', '土庫旺堡', '德賢旺堡', '惠民旺堡',
+                    '旺芳大社', '旺芳楠梓', '旺芳後昌', '旺芳鼎中', '旺芳高醫'
+                ];
+                const html = `
+                    <div class="fade-in pb-20">
+                        <div class="mb-6"><h2 class="text-2xl font-bold text-slate-800" data-i18n="orders.branch.title">${t('orders.branch.title')}</h2><p class="text-slate-500" data-i18n="orders.branch.subtitle">${t('orders.branch.subtitle')}</p></div>
+                        <div class="bg-white rounded-xl shadow-sm border border-slate-100 max-w-4xl mx-auto overflow-hidden">
+                            <form id="order-form">
+                                <div class="p-6 border-b border-slate-100 bg-slate-50">
+                                    <label class="block text-sm font-bold text-slate-700 mb-2" data-i18n="orders.branch.selectBranch">${t('orders.branch.selectBranch')}</label>
+                                    <div class="flex flex-col gap-2">
+                                        <select name="branch-select" id="branch-select" class="w-full border p-2.5 rounded-lg bg-white shadow-sm">
+                                            ${branchOptions.map(b => `<option value="${b}">${b}</option>`).join('')}
+                                            <option value="custom">${t('orders.branch.customOption')}</option>
+                                        </select>
+                                        <input type="text" name="branch-custom" id="branch-custom" placeholder="${t('orders.branch.customPlaceholder')}" class="w-full border p-2.5 rounded-lg shadow-sm hidden" data-i18n-placeholder="orders.branch.customPlaceholder">
+                                    </div>
+                                    <div class="mt-4">
+                                        <label class="block text-xs font-medium text-slate-500 mb-1" data-i18n="orders.branch.orderDate">${t('orders.branch.orderDate')}</label>
+                                        <input type="date" id="order-date" class="w-full border p-2 rounded-lg bg-white" value="${new Date().toISOString().slice(0,10)}">
+                                    </div>
+                                </div>
+                                <div class="p-6">
+                                    <div class="mb-4 flex justify-between items-center">
+                                        <h3 class="font-bold text-lg text-slate-800" data-i18n="orders.branch.selectItems">${t('orders.branch.selectItems')}</h3>
+                                        <span class="text-sm text-slate-500" data-i18n="orders.branch.inputQtyHint">${t('orders.branch.inputQtyHint')}</span>
+                                    </div>
+                                    <div class="space-y-8">
+                                        ${Object.keys(categories).map(cat => `
+                                            <div>
+                                                <h4 class="font-bold text-blue-600 border-b border-blue-100 pb-2 mb-4 flex items-center gap-2">
+                                                    <i data-lucide="package" class="w-4 h-4"></i> ${cat}
+                                                </h4>
+                                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                    ${categories[cat].map(p => `
+                                                        <div class="flex items-center justify-between p-3 rounded-lg border border-slate-200 hover:border-blue-300 hover:bg-blue-50 transition-colors group">
+                                                            <div class="flex-1">
+                                                                <div class="font-medium text-slate-800">${p.name}</div>
+                                                                <div class="text-xs text-slate-500 flex gap-2">
+                                                                    <span>${p.sku}</span>
+                                                                    <span class="text-slate-400">|</span>
+                                                                    <span>${t('orders.branch.stockLabel')}: ${p.stock}</span>
+                                                                    <span class="text-slate-400">|</span>
+                                                                    <span>$${p.price}</span>
+                                                                </div>
+                                                            </div>
+                                                            <div class="flex items-center gap-2">
+                                                                <input type="number" min="0" placeholder="0" data-id="${p.id}" class="item-qty w-20 border border-slate-300 p-2 rounded-lg text-center font-bold text-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-shadow" onfocus="this.select()">
+                                                            </div>
+                                                        </div>
+                                                    `).join('')}
+                                                </div>
+                                            </div>
+                                        `).join('')}
+                                    </div>
+                                </div>
+                                <div class="p-6 bg-slate-50 border-t border-slate-100 sticky bottom-0 z-10">
+                                    <div class="flex items-center justify-between mb-4">
+                                        <span class="text-slate-600"><span data-i18n="orders.branch.totalItems">${t('orders.branch.totalItems')}</span>: <span id="total-items-count" class="font-bold text-slate-800">0</span></span>
+                                        <span class="text-slate-600"><span data-i18n="orders.branch.totalAmount">${t('orders.branch.totalAmount')}</span>: <span id="total-amount-est" class="font-bold text-blue-600 text-lg">$0</span></span>
+                                    </div>
+                                    <button type="submit" class="w-full bg-blue-600 text-white py-4 rounded-xl font-bold text-lg hover:bg-blue-700 shadow-lg shadow-blue-200 transition-all transform active:scale-95" data-i18n="orders.branch.submit">${t('orders.branch.submit')}</button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                `;
+                container.innerHTML = html;
+                const select = document.getElementById('branch-select');
+                const customInput = document.getElementById('branch-custom');
+                select.addEventListener('change', (e) => {
+                    if (e.target.value === 'custom') {
+                        customInput.classList.remove('hidden');
+                        customInput.required = true;
+                        customInput.focus();
+                    } else {
+                        customInput.classList.add('hidden');
+                        customInput.required = false;
+                    }
+                });
+                const inputs = container.querySelectorAll('.item-qty');
+                const totalCountSpan = document.getElementById('total-items-count');
+                const totalAmountSpan = document.getElementById('total-amount-est');
+                const calculateTotal = () => {
+                    let count = 0;
+                    let amount = 0;
+                    inputs.forEach(input => {
+                        const qty = parseInt(input.value) || 0;
+                        if (qty > 0) {
+                            count++;
+                            const p = products.find(prod => prod.id === input.dataset.id);
+                            if (p) amount += p.price * qty;
+                        }
+                    });
+                    totalCountSpan.textContent = count;
+                    totalAmountSpan.textContent = '$' + amount.toLocaleString();
+                };
+                inputs.forEach(input => { input.addEventListener('input', calculateTotal); });
+                document.getElementById('order-form').addEventListener('submit', e => {
+                    e.preventDefault();
+                    const selectVal = document.getElementById('branch-select').value;
+                    const customVal = document.getElementById('branch-custom').value;
+                    const branch = selectVal === 'custom' ? customVal : selectVal;
+                    if (!branch) { alert(t('orders.branch.fillBranchWarn')); return; }
+                    const items = [];
+                    container.querySelectorAll('.item-qty').forEach(input => {
+                        const qty = parseInt(input.value) || 0;
+                        if (qty > 0) items.push({ productId: input.dataset.id, quantity: qty });
+                    });
+                    if(items.length === 0) { alert(t('orders.branch.warnSelectItems')); return; }
+                    const dateStr = document.getElementById('order-date').value || new Date().toISOString().slice(0,10);
+                    const d = new Date(dateStr);
+                    d.setHours(12,0,0,0);
+                    const dateISO = d.toISOString();
+                    store.createOrder(branch, items, dateISO);
+                    alert(t('orders.branch.success'));
+                    e.target.reset();
+                    customInput.classList.add('hidden');
+                    calculateTotal();
+                    window.scrollTo(0, 0);
+                });
+                if(window.lucide) window.lucide.createIcons();
+                applyI18n(container);
+            }
+        };
+    </script>
+
+    <script>
+        class CostsView {
+            constructor(storeInstance) {
+                this.store = storeInstance;
+                const preset = this.store.getCostsDatePreset();
+                this.state = { date: (preset || new Date().toISOString().slice(0,10)) };
+                if (preset) this.store.clearCostsDatePreset();
+            }
+            render(container) {
+                const products = this.store.getProducts();
+                const costs = this.store.getCostsByDate(this.state.date);
+                const html = `
+                    <div class="fade-in max-w-4xl mx-auto pb-20">
+                        <div class="mb-4 flex items-center justify-between">
+                            <div>
+                                <h2 class="text-2xl font-bold text-slate-800" data-i18n="costs.title">${t('costs.title')}</h2>
+                                <p class="text-slate-500" data-i18n="costs.subtitle">${t('costs.subtitle')}</p>
+                            </div>
+                            <button id="link-to-reports" class="text-xs bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded" data-i18n="costs.goReports">${t('costs.goReports')}</button>
+                        </div>
+                        <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-4 space-y-4">
+                            <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+                                <input type="date" id="cost-date" class="border border-slate-300 rounded-lg p-2 text-sm bg-white" value="${this.state.date}">
+                                <select id="cost-product" class="border border-slate-300 rounded-lg p-2 text-sm bg-white">
+                                    <option value="">${t('costs.selectProductLabel')}</option>
+                                    ${products.map(p => `<option value="${p.id}">${p.name}${p.sku ? ' (' + p.sku + ')' : ''}</option>`).join('')}
+                                </select>
+                                <div class="flex items-center gap-1">
+                                    <span>$</span>
+                                    <input type="number" id="cost-amount" min="0" step="0.01" class="w-full border-b border-slate-300 focus:border-blue-500 focus:outline-none bg-transparent p-1" placeholder="${t('costs.inputCostPlaceholder')}" data-i18n-placeholder="costs.inputCostPlaceholder">
+                                </div>
+                                <button id="cost-add" class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700" data-i18n="costs.addConfirm">${t('costs.addConfirm')}</button>
+                            </div>
+                        </div>
+                        <div class="mt-6 bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+                            <div class="px-4 py-3 bg-slate-100 border-b border-slate-200 font-bold text-slate-700 flex items-center gap-2">
+                                <i data-lucide="table" class="w-4 h-4"></i> ${t('costs.todayList')}
+                            </div>
+                            <div class="overflow-x-auto">
+                                <table class="min-w-full divide-y divide-slate-200">
+                                    <thead class="bg-slate-50">
+                                            <tr>
+                                                <th class="px-4 py-2 text-left text-xs font-medium text-slate-500 uppercase">${t('table.product')} / SKU</th>
+                                                <th class="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">${t('table.cost')}</th>
+                                                <th class="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">${t('inventory.headers.actions')}</th>
+                                            </tr>
+                                    </thead>
+                                    <tbody id="cost-table-body" class="divide-y divide-slate-200">
+                                        ${costs.length === 0 ? `
+                                            <tr><td colspan="3" class="px-4 py-3 text-center text-sm text-slate-400">${t('costs.empty')}</td></tr>
+                                        ` : costs.map(c => {
+                                            const p = products.find(x => x.id === c.productId);
+                                            return `
+                                                <tr>
+                                                    <td class="px-4 py-2">
+                                                        <div class="text-sm font-medium text-slate-900">${p ? p.name : '未知商品'}</div>
+                                                        <div class="text-xs text-slate-500">${p ? p.sku : ''}</div>
+                                                    </td>
+                                                    <td class="px-4 py-2 text-right">
+                                                        <div class="flex items-center justify-end gap-1">
+                                                            <span>$</span>
+                                                            <input type="number" min="0" step="0.01" class="cost-edit w-24 text-right border-b border-transparent hover:border-blue-300 focus:border-blue-500 focus:outline-none bg-transparent" data-id="${c.productId}" value="${parseFloat(c.cost) || 0}">
+                                                        </div>
+                                                    </td>
+                                                    <td class="px-4 py-2 text-right">
+                                                        <button class="btn-cost-save text-xs bg-green-600 text-white px-3 py-1.5 rounded mr-2" data-id="${c.productId}">${t('buttons.save')}</button>
+                                                        <button class="btn-cost-delete text-slate-400 hover:text-red-600" data-id="${c.productId}"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                                                    </td>
+                                                </tr>
+                                            `;
+                                        }).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                container.innerHTML = html;
+                const btnLinkReports = container.querySelector('#link-to-reports');
+                if (btnLinkReports) btnLinkReports.addEventListener('click', () => {
+                    store.setReportPreset({ start: this.state.date, end: this.state.date, branch: 'all' });
+                    window.location.hash = '#reports';
+                });
+                const dateEl = container.querySelector('#cost-date');
+                if (dateEl) {
+                    dateEl.addEventListener('change', e => {
+                        this.state.date = e.target.value;
+                        this.render(container);
+                    });
+                }
+                const addBtn = container.querySelector('#cost-add');
+                if (addBtn) {
+                    addBtn.addEventListener('click', () => {
+                        const pid = (container.querySelector('#cost-product') || {}).value || '';
+                        const amountInput = container.querySelector('#cost-amount');
+                        const val = amountInput ? parseFloat(amountInput.value) : NaN;
+                        if (!pid) { alert(t('costs.warnSelectProduct')); return; }
+                        const amount = isNaN(val) ? 0 : val;
+                        this.store.setCost(this.state.date, pid, amount);
+                        this.render(container);
+                    });
+                }
+                container.querySelectorAll('.btn-cost-save').forEach(btn => {
+                    btn.addEventListener('click', e => {
+                        const pid = e.currentTarget.dataset.id;
+                        const input = container.querySelector(\`.cost-edit[data-id="\${pid}"]\`);
+                        const val = parseFloat(input.value) || 0;
+                        this.store.setCost(this.state.date, pid, val);
+                        this.render(container);
+                    });
+                });
+                container.querySelectorAll('.btn-cost-delete').forEach(btn => {
+                    btn.addEventListener('click', e => {
+                        const pid = e.currentTarget.dataset.id;
+                        const removed = this.store.removeCost(this.state.date, pid);
+                        this.render(container);
+                        if (removed) UI.showUndo(t('costs.deletedOne'), () => {
+                            this.store.setCost(this.state.date, pid, removed.cost);
+                            this.render(container);
+                        });
+                    });
+                });
+                if (window.lucide) window.lucide.createIcons();
+                applyI18n(container);
+            }
+        }
+    </script>
+
+    <script>
+        class App {
+            constructor() {
+                this.mainContent = document.getElementById('main-content');
+                this.sidebar = document.getElementById('sidebar-container');
+                this.mobileMenu = document.getElementById('mobile-menu');
+                this.init();
+            }
+            init() {
+                store.subscribe(() => { this.renderSidebar(); this.handleRoute(); });
+                window.addEventListener('hashchange', () => this.handleRoute());
+                this.renderSidebar();
+                document.getElementById('mobile-menu-btn').addEventListener('click', () => {
+                    this.mobileMenu.classList.remove('-translate-x-full');
+                    document.getElementById('mobile-menu-overlay').classList.remove('hidden');
+                });
+                document.getElementById('mobile-menu-overlay').addEventListener('click', () => {
+                    this.mobileMenu.classList.add('-translate-x-full');
+                    document.getElementById('mobile-menu-overlay').classList.add('hidden');
+                });
+                if (!window.location.hash) window.location.hash = '#dashboard';
+                else this.handleRoute();
+            }
+            renderSidebar() {
+                const isHQ = store.getRole() === 'hq';
+                const items = isHQ
+                    ? [
+                        { id: 'dashboard', label: t('nav.dashboard'), icon: 'layout-dashboard' },
+                        { id: 'inventory', label: t('nav.inventory'), icon: 'package' },
+                        { id: 'orders', label: t('nav.orders_hq'), icon: 'shopping-cart' },
+                        { id: 'reports', label: t('nav.reports'), icon: 'file-bar-chart' },
+                        { id: 'costs', label: t('nav.costs'), icon: 'banknote' }
+                    ]
+                    : [
+                        { id: 'orders', label: t('nav.orders_branch'), icon: 'shopping-cart' }
+                    ];
+                const html = `
+                    <div class="p-6 flex items-center gap-3"><div class="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center"><i data-lucide="box" class="text-white w-5 h-5"></i></div><span class="font-bold text-xl tracking-tight">CHENG design order</span></div>
+                    <nav class="flex-1 px-4 space-y-2 mt-4">
+                        ${items.map(i => `<a href="#${i.id}" class="nav-link flex items-center gap-3 px-4 py-3 rounded-lg text-slate-400 hover:bg-slate-800 hover:text-white transition-colors" data-target="${i.id}"><i data-lucide="${i.icon}" class="w-5 h-5"></i><span>${i.label}</span></a>`).join('')}
+                    </nav>
+                    <div class="p-4 border-t border-slate-800">
+                        <div class="bg-slate-800 rounded-xl p-4">
+                            <div class="text-xs text-slate-400 uppercase mb-2">${t('role.currentView')}</div>
+                            <div class="flex items-center justify-between">
+                                <span class="font-medium text-sm text-white">${isHQ ? t('role.hq') : t('role.branch')}</span>
+                                <button id="role-switch" class="text-xs bg-blue-600 hover:bg-blue-700 text-white px-2 py-1 rounded">${t('role.switch')}</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                this.sidebar.innerHTML = html;
+                this.mobileMenu.innerHTML = html;
+                this.renderLangControl();
+                const attach = (el) => {
+                    const btn = el.querySelector('#role-switch');
+                    if(btn) btn.addEventListener('click', () => {
+                        if (!isHQ) {
+                            UI.showModal(t('alerts.adminVerify'), `<input type="password" id="admin-pwd" class="w-full border p-2 rounded" placeholder="${t('alerts.adminPwdPlaceholder')}" data-i18n-placeholder="alerts.adminPwdPlaceholder">`, () => {
+                                const pwd = document.getElementById('admin-pwd').value;
+                                if (pwd !== '0915') { alert(t('alerts.adminPwdWrong')); return; }
+                                store.setRole('hq');
+                                window.location.hash = '#dashboard';
+                            });
+                            return;
+                        }
+                        store.setRole('branch');
+                        window.location.hash = '#orders';
+                    });
+                };
+                attach(this.sidebar); attach(this.mobileMenu);
+                this.updateActive();
+                if(window.lucide) window.lucide.createIcons();
+            }
+            renderLangControl() {
+                let wrap = document.getElementById('lang-select-wrap');
+                if (!wrap) {
+                    wrap = document.createElement('div');
+                    wrap.id = 'lang-select-wrap';
+                    wrap.style.position = 'fixed';
+                    wrap.style.top = '8px';
+                    wrap.style.right = '8px';
+                    wrap.style.zIndex = '100';
+                    wrap.innerHTML = `<select id="lang-select" class="border border-slate-300 rounded px-2 py-1 text-sm bg-white">
+                        <option value="zh">繁體中文</option>
+                        <option value="vi">Tiếng Việt</option>
+                    </select>`;
+                    document.body.appendChild(wrap);
+                }
+                const sel = document.getElementById('lang-select');
+                sel.value = store.getLanguage();
+                sel.onchange = (e) => { store.setLanguage(e.target.value); };
+            }
+            updateActive() {
+                const hash = window.location.hash.slice(1) || 'dashboard';
+                document.querySelectorAll('.nav-link').forEach(l => {
+                    if(l.dataset.target === hash) { l.classList.add('bg-slate-800', 'text-white'); l.classList.remove('text-slate-400'); }
+                    else { l.classList.remove('bg-slate-800', 'text-white'); l.classList.add('text-slate-400'); }
+                });
+                this.mobileMenu.classList.add('-translate-x-full');
+                document.getElementById('mobile-menu-overlay').classList.add('hidden');
+            }
+            handleRoute() {
+                const hash = window.location.hash.slice(1) || 'dashboard';
+                const isHQ = store.getRole() === 'hq';
+                if (!isHQ && (hash === 'dashboard' || hash === 'inventory' || hash === 'reports' || hash === 'costs')) {
+                    alert(t('alerts.hqOnly'));
+                    window.location.hash = '#orders';
+                    return;
+                }
+                this.updateActive();
+                this.mainContent.innerHTML = '';
+                try {
+                    if(hash === 'dashboard') DashboardView.render(this.mainContent);
+                    else if(hash === 'inventory') InventoryView.render(this.mainContent);
+                    else if(hash === 'orders') OrdersView.render(this.mainContent);
+                    else if(hash === 'reports') ReportsView.render(this.mainContent);
+                    else if(hash === 'costs') new CostsView(store).render(this.mainContent);
+                } catch (err) {
+                    this.mainContent.innerHTML = `
+                        <div class="max-w-3xl mx-auto p-6 bg-red-50 border border-red-100 rounded-xl text-red-700">
+                            <div class="font-bold mb-2">頁面載入失敗</div>
+                            <div class="text-sm">錯誤訊息: ${err && err.message ? err.message : '未知錯誤'}</div>
+                        </div>
+                    `;
+                    console.error('Route render error:', err);
+                }
+            }
+        }
+        new App();
+    </script>
+</body>
+</html>
